@@ -843,11 +843,14 @@ def annotate_fasta(fasta_file, format, directory: str = "", organelle="", circul
         elif format == "gff3":
             gff3_dst = Path(directory) / f"{fasta_stem}.gff3"
             shutil.move(export_gff3, gff3_dst)
-            if keep_old and reordered:
-                old_path = Path(directory) / f"{fasta_stem}_old.fasta"
-                input_fasta.rename(old_path)
-                fasta_dst = Path(directory) / fasta_file
-                shutil.move(working_fasta, fasta_dst)
+
+        # If the genome was rotated, the annotation coordinates refer to the
+        # rotated sequence, so it has to replace the input file. Whether the
+        # pre-rotation sequence is kept as a backup is a separate choice.
+        if reordered:
+            if keep_old:
+                input_fasta.rename(Path(directory) / f"{fasta_stem}_old.fasta")
+            shutil.move(working_fasta, Path(directory) / fasta_file)
 
     
     elapsed = time.time() - start_time
