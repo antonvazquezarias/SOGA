@@ -26,6 +26,10 @@ def main():
         "--no-keep-old", dest="keep_old", action="store_false",
         help="Discard the original (pre-rotation) fasta instead of keeping it. Only when exporting in gff3"
     )
+    parser.add_argument(
+        "--keep-intermediates", action="store_true",
+        help="Also write the MFannot table (.tbl) and the Aragorn output (.txt)"
+    )
 
     args = parser.parse_args()
 
@@ -36,6 +40,7 @@ def main():
         organelle=args.organelle,
         circular=args.circular,
         keep_old=args.keep_old,
+        keep_intermediates=args.keep_intermediates,
     )
 
 if __name__ == "__main__":

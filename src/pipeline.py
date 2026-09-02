@@ -153,6 +153,7 @@ def annotate_mfannot(fasta_file, directory, organelle):
         )
     tbl_file = candidates[-1]
     shutil.move(tbl_file, folder / f"{file_name}.tbl")
+    return proc.stdout or ""
 
 def annotate_aragorn(fasta_file, directory, organelle, circular=True):
     """
@@ -184,8 +185,8 @@ def annotate_aragorn(fasta_file, directory, organelle, circular=True):
     else:
         topology = "l"  
 
-    # Run Aragorn in Docker in batch mode
-    subprocess.run([
+    # Run Aragorn in batch mode
+    proc = subprocess.run([
         "aragorn",
         "-t",       # tRNA
         "-m",       # tmRNA
@@ -195,7 +196,17 @@ def annotate_aragorn(fasta_file, directory, organelle, circular=True):
         "-w",       # batch mode
         "-o", f"{folder}/{file_name}.txt",
         f"{folder}/{file_name}.fasta"
-    ], check=True)
+    ], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, universal_newlines=True)
+
+    if proc.returncode != 0:
+        log = (proc.stdout or "").strip()
+        tail = "\n".join(log.splitlines()[-20:]) or "(Aragorn produced no output)"
+        raise RuntimeError(
+            f"Aragorn failed for {file_name} in {folder}\n"
+            f"  exit code: {proc.returncode}\n"
+            f"  last lines of Aragorn output:\n{tail}"
+        )
+    return proc.stdout or ""
 
 def mfannot_to_gff3(tbl_file, seq_name="Default_name", export=True, directory: str = "", organelle=""):
     """
@@ -738,7 +749,7 @@ def merge_annotations(mfannot_gff3, aragorn_gff3, seq_name="Default_name", expor
 
     return sorted_df
 
-def annotate_fasta(fasta_file, format, directory: str = "", organelle="", circular=False, keep_old=True):
+def annotate_fasta(fasta_file, format, directory: str = "", organelle="", circular=False, keep_old=True, keep_intermediates=False):
     """
     Main pipeline: Annotates a FASTA file using MFannot and Aragorn.
     Handles sequence rotation if the genome is circular.
@@ -755,6 +766,9 @@ def annotate_fasta(fasta_file, format, directory: str = "", organelle="", circul
         If True, attempts to rotate the genome to start at rns.
     keep_old : bool
         If True, keeps the original sequence file before rotation.
+    keep_intermediates : bool
+        If True, also writes the MFannot table and the Aragorn output next to
+        the results instead of discarding them with the temporary directory.
     """
     import time
     start_time = time.time()
@@ -770,13 +784,42 @@ def annotate_fasta(fasta_file, format, directory: str = "", organelle="", circul
         fasta_stem = input_fasta.stem
         tbl_file = tmp_path / f"{fasta_stem}.tbl"
 
+        log_path = Path(directory) / f"{fasta_stem}.log"
+
+        def log(text, section=None):
+            """Append to the run log, printing anything that is not tool output."""
+            with open(log_path, "a") as fh:
+                if section:
+                    fh.write(f"\n----- {section} -----\n{text.rstrip()}\n")
+                else:
+                    fh.write(f"{text}\n")
+            if not section:
+                print(text)
+
+        log_path.write_text(
+            f"SOGA annotation of {fasta_file}\n"
+            f"  started:    {time.strftime('%Y-%m-%d %H:%M:%S')}\n"
+            f"  organelle:  {organelle}\n"
+            f"  format:     {format}\n"
+            f"  circular:   {circular}\n"
+            f"  keep_old:   {keep_old}\n"
+        )
+
+        def run_mfannot(path, section):
+            try:
+                out = annotate_mfannot(str(path), tmp_path, organelle)
+            except RuntimeError as e:
+                log(str(e), section)
+                raise
+            log(out, section)
+
         reordered = False
         tbl_ready = False
 
         if circular:
             reordered = True
             # Annotate first attempt to find landmarks
-            annotate_mfannot(str(working_fasta), tmp_path, organelle)
+            run_mfannot(working_fasta, "MFannot (pass 1, locating rns)")
 
             try:
                 reorder_fasta_by_rns(str(working_fasta), str(tbl_file), tmp_path, keep_old=False)
@@ -790,7 +833,7 @@ def annotate_fasta(fasta_file, format, directory: str = "", organelle="", circul
                     rotated_tbl = tmp_path / f"{fasta_stem}_rotated.tbl"
 
                     reorder_fasta(str(working_fasta), strand="+", cut_pos=3000, new_seq_name=str(rotated_fasta))
-                    annotate_mfannot(str(rotated_fasta), tmp_path, organelle)
+                    run_mfannot(rotated_fasta, "MFannot (pass 1 retry, after blind rotation)")
 
                     try:
                         reorder_fasta_by_rns(str(rotated_fasta), str(rotated_tbl), tmp_path, keep_old=False)
@@ -799,12 +842,12 @@ def annotate_fasta(fasta_file, format, directory: str = "", organelle="", circul
                         tbl_file.unlink()
                         rotated_tbl.rename(tbl_file)
                     except ValueError:
-                        print(f"No rns found in {fasta_stem}, proceeding without reordering")
+                        log(f"No rns found in {fasta_stem}, proceeding without reordering")
                         reordered = False
 
                 # Case 2: rns already at start → use existing annotation
                 elif msg == "rns already at position 1":
-                    print(f"rns already at position 1 in {fasta_stem}, using existing annotation")
+                    log(f"rns already at position 1 in {fasta_stem}, using existing annotation")
                     reordered = False
                     tbl_ready = True
 
@@ -813,13 +856,13 @@ def annotate_fasta(fasta_file, format, directory: str = "", organelle="", circul
 
         # Generate final annotations
         if not tbl_ready:
-            annotate_mfannot(str(working_fasta), tmp_path, organelle)
-        annotate_aragorn(str(working_fasta), tmp_path, organelle, circular)
+            run_mfannot(working_fasta, "MFannot (final pass)")
+        log(annotate_aragorn(str(working_fasta), tmp_path, organelle, circular), "Aragorn")
         
         mf_df = mfannot_to_gff3(str(tbl_file), fasta_stem, False, tmp_path, organelle)
         ar_df = aragorn_to_gff3(f"{fasta_stem}.txt", fasta_stem, False, tmp_path, organelle)
         if mf_df.empty and ar_df.empty:
-            print(f"File {fasta_stem} has no features")
+            log(f"File {fasta_stem} has no features")
             return
         else:
             merge_annotations(mf_df, ar_df, fasta_stem, True, tmp_path)
@@ -857,7 +900,11 @@ def annotate_fasta(fasta_file, format, directory: str = "", organelle="", circul
                 input_fasta.rename(Path(directory) / f"{fasta_stem}_old.fasta")
             shutil.move(working_fasta, Path(directory) / fasta_file)
 
-    
-    elapsed = time.time() - start_time
-    m, s = divmod(elapsed, 60)
-    print(f"Annotation completed in {int(m)} min {s:.1f} s")
+        if keep_intermediates:
+            for src in (tmp_path / f"{fasta_stem}.tbl", tmp_path / f"{fasta_stem}.txt"):
+                if src.exists():
+                    shutil.copy(src, Path(directory) / src.name)
+
+        elapsed = time.time() - start_time
+        m, s = divmod(elapsed, 60)
+        log(f"Annotation completed in {int(m)} min {s:.1f} s")
