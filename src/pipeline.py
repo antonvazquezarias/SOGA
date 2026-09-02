@@ -891,9 +891,12 @@ def annotate_fasta(fasta_file, format, directory: str = "", organelle="", circul
         # is only attempted for single-contig genomes; annotation itself is
         # contig-aware either way.
         contig_ids = fasta_contig_ids(working_fasta)
+        # A fragmented assembly is a set of linear pieces, so --circular only
+        # takes effect for a single-sequence file.
+        treat_circular = circular and len(contig_ids) == 1
         reordered = False
 
-        if circular and len(contig_ids) > 1:
+        if circular and not treat_circular:
             log(f"{fasta_stem}: {len(contig_ids)} contigs, annotating each "
                 f"without rotation to rns")
         elif circular:
@@ -937,6 +940,9 @@ def annotate_fasta(fasta_file, format, directory: str = "", organelle="", circul
             for rec in SeqIO.parse(str(working_fasta), "fasta"):
                 rec.name = rec.id[:16]  # GenBank LOCUS name has a length cap
                 rec.annotations["molecule_type"] = "DNA"
+                # Without this the LOCUS line has no topology and readers
+                # default to linear.
+                rec.annotations["topology"] = "circular" if treat_circular else "linear"
                 records[rec.id] = rec
 
             with open(export_gff3) as gff_handle:
