@@ -9,6 +9,21 @@ from Bio import SeqIO
 from BCBio import GFF
 
 # Functions
+def fasta_contig_ids(fasta_file, directory: str = ""):
+    """
+    Returns the sequence IDs of a FASTA file, in order of appearance.
+
+    The ID is the first whitespace-delimited token of each header line, which
+    is how Aragorn refers to each contig. MFannot instead renames them C_0,
+    C_1, ... in the same order, so this list maps one onto the other.
+    """
+    ids = []
+    with open(Path(directory) / fasta_file) as f:
+        for line in f:
+            if line.startswith(">"):
+                ids.append(line[1:].split()[0])
+    return ids
+
 def reorder_fasta(fasta_file, strand, cut_pos, new_seq_name=None, old_seq_name=None, directory: str = ""):
     """
     Reorders a circular sequence starting from a specific cut position
@@ -219,7 +234,7 @@ def annotate_aragorn(fasta_file, directory, organelle, circular=True):
         )
     return proc.stdout or ""
 
-def mfannot_to_gff3(tbl_file, seq_name="Default_name", export=True, directory: str = "", organelle=""):
+def mfannot_to_gff3(tbl_file, seq_name="Default_name", export=True, directory: str = "", organelle="", contig_ids=None):
     """
     Parses MFannot .tbl output and converts it to GFF3 format.
 
@@ -228,13 +243,17 @@ def mfannot_to_gff3(tbl_file, seq_name="Default_name", export=True, directory: s
     tbl_file : str
         Name of the MFannot .tbl file.
     seq_name : str
-        Sequence identifier to use in the GFF3.
+        Fallback sequence identifier, used when contig_ids is not given.
     export : bool
         If True, writes the result to a .gff3 file.
     directory : str or Path
         Working directory.
     organelle : str
         Used to set translation table attributes.
+    contig_ids : list of str, optional
+        Real sequence IDs in FASTA order. MFannot renames contigs to C_0, C_1,
+        ... in that order, so the Nth ">Feature" section is given
+        contig_ids[N]. If None, seq_name is used for every feature.
 
     Returns:
     --------
@@ -243,10 +262,13 @@ def mfannot_to_gff3(tbl_file, seq_name="Default_name", export=True, directory: s
     """
 
     gff_columns = ["seqid", "source", "type", "start", "end", "score", "strand", "phase", "attributes"]
-    # Read file, skipping header and footer lines specific to MFannot output
+    # A table holds one section per contig, each introduced by a
+    # ">Feature C_<n> ..." line in FASTA order.
     with open(Path(directory) / tbl_file) as f:
-        lines = f.read().splitlines()[1:-1]
-    
+        raw_lines = f.read().splitlines()
+
+    lines = [l for l in raw_lines if l.strip() and not l.startswith(">")]
+
     if len(lines) == 0:
         empty_df = pd.DataFrame(columns=gff_columns)
         
@@ -260,14 +282,25 @@ def mfannot_to_gff3(tbl_file, seq_name="Default_name", export=True, directory: s
         return empty_df
 
 
-    # Parse features and their qualifiers
+    # Parse features and their qualifiers, tracking which contig each belongs to
     features = []
     current_feature = None
+    contig_index = -1
 
-    for line in lines:
+    for line in raw_lines:
+        if not line.strip():
+            continue
+        if line.startswith(">"):
+            # ">Feature C_<n> Table1": trust the number MFannot writes rather
+            # than counting sections, so a missing section cannot shift the map.
+            match = re.match(r">Feature\s+C_(\d+)", line)
+            contig_index = int(match.group(1)) if match else contig_index + 1
+            current_feature = None
+            continue
         elements = line.split("\t")
         if elements[0]:
-            current_feature = {"feature": elements, "qualifiers": []}
+            current_feature = {"feature": elements, "qualifiers": [],
+                               "contig_index": contig_index}
             features.append(current_feature)
         elif current_feature is not None:
             current_feature["qualifiers"].append(elements)
@@ -280,6 +313,10 @@ def mfannot_to_gff3(tbl_file, seq_name="Default_name", export=True, directory: s
     for feat in features:
         f = feat["feature"]
         qual = feat["qualifiers"]
+
+        # Map this feature onto its real sequence ID via the contig section order
+        ci = feat["contig_index"]
+        seqid = contig_ids[ci] if (contig_ids and 0 <= ci < len(contig_ids)) else seq_name
 
         # Safe extraction of row_type (inherit from previous if missing)
         if len(f) > 2 and f[2]:
@@ -364,7 +401,7 @@ def mfannot_to_gff3(tbl_file, seq_name="Default_name", export=True, directory: s
             qualifiers_dict[key] = val
 
         row = [
-            seq_name,
+            seqid,
             "MFannot",
             row_type,
             start,
@@ -398,7 +435,8 @@ def aragorn_to_gff3(txt_file, seq_name="Default_name", export=True, directory: s
     txt_file : str
         Name of the Aragorn output file.
     seq_name : str
-        Sequence identifier for GFF3.
+        Fallback sequence identifier, used only if a data row precedes any
+        contig header, which does not happen in normal Aragorn output.
     export : bool
         If True, writes the result to a .gff3 file.
     directory : str or Path
@@ -412,30 +450,49 @@ def aragorn_to_gff3(txt_file, seq_name="Default_name", export=True, directory: s
         DataFrame containing the GFF3 data.
     """
     gff_columns = ["seqid", "source", "type", "start", "end", "score", "strand", "phase", "attributes"]
-    
-    file_path = Path(directory) / txt_file
-    with open(file_path) as f:
-        full_content = f.read()
 
-    # Early exit if no genes are found
-    if "0 genes found" in full_content or not full_content.strip():
+    # Batch (-w) output holds one section per contig:
+    #   >contig_id len=...
+    #   N genes found
+    #   1  tRNA-Xxx  [a,b]  pos  (codon)
+    # and closes with a ">end ..." line. Keep the contig id for every data row,
+    # since a contig with no genes must not discard the others.
+    with open(Path(directory) / txt_file) as f:
+        raw_lines = f.read().splitlines()
+
+    seqids = []
+    data_rows = []
+    current_seqid = seq_name
+    for line in raw_lines:
+        stripped = line.strip()
+        if not stripped:
+            continue
+        if stripped.startswith(">"):
+            if not stripped.startswith(">end"):
+                current_seqid = stripped[1:].split()[0]
+            continue
+        if stripped.endswith("genes found"):
+            continue
+        seqids.append(current_seqid)
+        data_rows.append(re.sub(r"[ \t]+", " ", stripped).split(" "))
+
+    if not data_rows:
         empty_df = pd.DataFrame(columns=gff_columns)
-        
+
         if export:
             file_name = Path(directory) / f"{seq_name}_AR.gff3"
             with open(file_name, "w") as f:
                 f.write("##gff-version 3\n")
-            # This writes the column names even if there is no data
+            # This ensures the file exists and is valid GFF3 even if empty
             empty_df.to_csv(file_name, sep="\t", header=False, index=False, mode="a")
-            
+
         return empty_df
 
-    # Process lines normally
-    lines = full_content.splitlines()[2:]
-    lines = [re.sub(r"[ \t]+", " ", line).strip() for line in lines if line.strip()]
-    df = pd.DataFrame([line.split(" ") for line in lines])
-    
-    # Cleaning and Pre-processing columns
+    df = pd.DataFrame(data_rows)
+    df['seqid'] = seqids
+
+    # Cleaning and Pre-processing columns. Column 0 is Aragorn's per-section
+    # row number, which restarts on every contig.
     df = df.drop(columns=0).reset_index(drop=True)
     df['strand'] = df[2].str.startswith('c').map({True: '-', False: '+'})
     
@@ -494,7 +551,7 @@ def aragorn_to_gff3(txt_file, seq_name="Default_name", export=True, directory: s
     numeric_cols = ['start', 'end', 'position', 'intron_distance', 'intron_length']
     df[numeric_cols] = df[numeric_cols].apply(pd.to_numeric, errors='coerce')
 
-    df = df[['type', 'start', 'end', 'strand', 'codon', 'aminoacid', 'feature_start', 'feature_end', 'intron_start', 'intron_end']]
+    df = df[['seqid', 'type', 'start', 'end', 'strand', 'codon', 'aminoacid', 'feature_start', 'feature_end', 'intron_start', 'intron_end']]
 
     # Construct GFF3 rows
     gff_rows = []
@@ -522,7 +579,7 @@ def aragorn_to_gff3(txt_file, seq_name="Default_name", export=True, directory: s
         tmRNA_id = f"{gene_id}_tmRNA"
 
         gff_rows.append({
-            "seqid": seq_name,
+            "seqid": row['seqid'],
             "source": "ARAGORN",
             "type": "gene",
             "start": row['start'],
@@ -546,7 +603,7 @@ def aragorn_to_gff3(txt_file, seq_name="Default_name", export=True, directory: s
 
                 # Part 1 (Exon 1)
                 gff_rows.append({
-                    "seqid": seq_name,
+                    "seqid": row['seqid'],
                     "source": "ARAGORN",
                     "type": "tRNA",
                     "start": row['start'],
@@ -563,7 +620,7 @@ def aragorn_to_gff3(txt_file, seq_name="Default_name", export=True, directory: s
                     ] if x])
                 })
                 gff_rows.append({
-                    "seqid": seq_name,
+                    "seqid": row['seqid'],
                     "source": "ARAGORN",
                     "type": "exon",
                     "start": row['start'],
@@ -575,7 +632,7 @@ def aragorn_to_gff3(txt_file, seq_name="Default_name", export=True, directory: s
                 })
                 # Intron
                 gff_rows.append({
-                    "seqid": seq_name,
+                    "seqid": row['seqid'],
                     "source": "ARAGORN",
                     "type": "intron",
                     "start": row['intron_start'],
@@ -587,7 +644,7 @@ def aragorn_to_gff3(txt_file, seq_name="Default_name", export=True, directory: s
                 })
                 # Part 2 (Exon 2)
                 gff_rows.append({
-                    "seqid": seq_name,
+                    "seqid": row['seqid'],
                     "source": "ARAGORN",
                     "type": "tRNA",
                     "start": row['intron_end'] + 1,
@@ -604,7 +661,7 @@ def aragorn_to_gff3(txt_file, seq_name="Default_name", export=True, directory: s
                     ] if x])
                 })
                 gff_rows.append({
-                    "seqid": seq_name,
+                    "seqid": row['seqid'],
                     "source": "ARAGORN",
                     "type": "exon",
                     "start": row['intron_end'] + 1,
@@ -617,7 +674,7 @@ def aragorn_to_gff3(txt_file, seq_name="Default_name", export=True, directory: s
             else:
                 # Standard tRNA
                 gff_rows.append({
-                    "seqid": seq_name,
+                    "seqid": row['seqid'],
                     "source": "ARAGORN",
                     "type": "tRNA",
                     "start": row['start'],
@@ -637,7 +694,7 @@ def aragorn_to_gff3(txt_file, seq_name="Default_name", export=True, directory: s
         # tmRNA Logic
         elif row['type'] == "tmRNA":
             gff_rows.append({
-                "seqid": seq_name,
+                "seqid": row['seqid'],
                 "source": "ARAGORN",
                 "type": "tmRNA",
                 "start": row['start'],
@@ -655,7 +712,7 @@ def aragorn_to_gff3(txt_file, seq_name="Default_name", export=True, directory: s
                 transl_table = None
             
             gff_rows.append({
-                "seqid": seq_name,
+                "seqid": row['seqid'],
                 "source": "ARAGORN",
                 "type": "CDS",
                 "start": row['feature_start'],
@@ -695,10 +752,15 @@ def sort_gff3(gff3_object):
     """
     custom_order = ["gene", "ncRNA", "rRNA", "tmRNA", "CDS", "tRNA", "intron", "exon"]
     category_type = pd.CategoricalDtype(categories=custom_order, ordered=True)
+    gff3_object = gff3_object.copy()
     gff3_object['type'] = gff3_object['type'].astype(category_type)
+    # Keep contigs grouped, in their order of first appearance (FASTA order)
+    seqid_order = list(dict.fromkeys(gff3_object['seqid']))
+    gff3_object['seqid'] = pd.Categorical(gff3_object['seqid'],
+                                          categories=seqid_order, ordered=True)
     gff3_object_sorted = gff3_object.sort_values(
-        by = ['start','type'],
-        ascending=[True,True]
+        by = ['seqid','start','type'],
+        ascending=[True,True,True]
     )
     return gff3_object_sorted
 
@@ -732,7 +794,7 @@ def merge_annotations(mfannot_gff3, aragorn_gff3, seq_name="Default_name", expor
     else:
         filtered_mf = mfannot_gff3
 
-    # 2. Avoid the FutureWarning by choosing the non-empty DF
+    # 2. Avoid a pandas FutureWarning by choosing the non-empty frame
     if filtered_mf.empty and aragorn_gff3.empty:
         merged_df = filtered_mf.copy() # Keeps the column structure
     elif filtered_mf.empty:
@@ -742,19 +804,19 @@ def merge_annotations(mfannot_gff3, aragorn_gff3, seq_name="Default_name", expor
     else:
         merged_df = pd.concat([filtered_mf, aragorn_gff3], ignore_index=True)
 
-    # 3. Only process and sort if there's data[cite: 1]
+    # 3. Only process and sort if there's data. Each feature keeps its own
+    #    seqid, so multi-contig genomes stay separated by contig.
     if not merged_df.empty:
-        merged_df['seqid'] = seq_name
         sorted_df = sort_gff3(merged_df)
     else:
         sorted_df = merged_df
 
-    # 4. Standard GFF3 Export[cite: 1]
+    # 4. Standard GFF3 export
     if export:
         file_name = Path(directory) / f"{seq_name}.gff3"
         with open(file_name, "w") as f:
             f.write("##gff-version 3\n")
-        # Only append data if sorted_df is not empty[cite: 1]
+        # Only append data if sorted_df is not empty
         if not sorted_df.empty:
             sorted_df.to_csv(file_name, sep="\t", header=False, index=False, mode="a")
 
@@ -824,9 +886,17 @@ def annotate_fasta(fasta_file, format, directory: str = "", organelle="", circul
                 raise
             log(out, section)
 
+        # Real sequence IDs in FASTA order, used to give each feature the right
+        # seqid. reorder_fasta treats the file as a single sequence, so rotation
+        # is only attempted for single-contig genomes; annotation itself is
+        # contig-aware either way.
+        contig_ids = fasta_contig_ids(working_fasta)
         reordered = False
 
-        if circular:
+        if circular and len(contig_ids) > 1:
+            log(f"{fasta_stem}: {len(contig_ids)} contigs, annotating each "
+                f"without rotation to rns")
+        elif circular:
             # Locate rns with nhmmer rather than a full MFannot pass. MFannot
             # loses any gene that spans the origin, so rns is invisible to it
             # in exactly the case where rotation matters most.
@@ -849,7 +919,8 @@ def annotate_fasta(fasta_file, format, directory: str = "", organelle="", circul
         run_mfannot(working_fasta, "MFannot")
         log(annotate_aragorn(str(working_fasta), tmp_path, organelle, circular), "Aragorn")
         
-        mf_df = mfannot_to_gff3(str(tbl_file), fasta_stem, False, tmp_path, organelle)
+        mf_df = mfannot_to_gff3(str(tbl_file), fasta_stem, False, tmp_path, organelle,
+                                contig_ids=contig_ids)
         ar_df = aragorn_to_gff3(f"{fasta_stem}.txt", fasta_stem, False, tmp_path, organelle)
         if mf_df.empty and ar_df.empty:
             log(f"File {fasta_stem} has no features")
@@ -861,22 +932,28 @@ def annotate_fasta(fasta_file, format, directory: str = "", organelle="", circul
         export_gff3 = tmp_path / f"{fasta_stem}.gff3"        
         
         if format == "gb":
-            bio_record = SeqIO.read(working_fasta, "fasta")
-            bio_record.id = fasta_stem
-            bio_record.name = fasta_stem[:16]  # GenBank LOCUS name has a length cap
-            with open(export_gff3) as gff_handle:
-                result = next(GFF.parse(gff_handle, base_dict={bio_record.id: bio_record}))
-            flat = []
-            stack = list(result.features)
-            while stack:
-                f = stack.pop(0)
-                flat.append(f)
-                if hasattr(f, "sub_features") and f.sub_features:
-                    stack = list(f.sub_features) + stack
+            # One GenBank record per contig, keyed by the seqid used in the GFF3
+            records = {}
+            for rec in SeqIO.parse(str(working_fasta), "fasta"):
+                rec.name = rec.id[:16]  # GenBank LOCUS name has a length cap
+                rec.annotations["molecule_type"] = "DNA"
+                records[rec.id] = rec
 
-            bio_record.features = flat
-            bio_record.annotations["molecule_type"] = "DNA"
-            SeqIO.write(bio_record, Path(directory) / f"{fasta_stem}.gb", "gb")
+            with open(export_gff3) as gff_handle:
+                annotated = list(GFF.parse(gff_handle, base_dict=records))
+
+            for rec in annotated:
+                flat = []
+                stack = list(rec.features)
+                while stack:
+                    f = stack.pop(0)
+                    flat.append(f)
+                    if hasattr(f, "sub_features") and f.sub_features:
+                        stack = list(f.sub_features) + stack
+                records[rec.id].features = flat
+
+            SeqIO.write([records[i] for i in contig_ids if i in records],
+                        str(Path(directory) / f"{fasta_stem}.gb"), "gb")
 
         elif format == "gff3":
             gff3_dst = Path(directory) / f"{fasta_stem}.gff3"
