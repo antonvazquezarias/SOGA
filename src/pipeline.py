@@ -135,16 +135,21 @@ def annotate_mfannot(fasta_file, directory, organelle):
     else:
         genetic_code = None
     
-    # Run MFannot via Docker, moving the .tbl to the mounted folder
-    subprocess.run([
+    # Run MFannot
+    proc = subprocess.run([
         "sh", "-c",
-        f"cd {folder} && /mfannot/mfannot -g {genetic_code} --tbl {file_name}.fasta > /dev/null 2>&1"
-    ], check=True)
+        f"cd {folder} && /mfannot/mfannot -g {genetic_code} --tbl {file_name}.fasta"
+    ], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, universal_newlines=True)
 
     candidates = sorted(folder.glob(f"{file_name}.fasta.new*.tbl"))
-    if not candidates:
-        raise FileNotFoundError(
-            f"MFannot did not produce a .tbl file for {file_name} in {folder}"
+    if proc.returncode != 0 or not candidates:
+        log = (proc.stdout or "").strip()
+        tail = "\n".join(log.splitlines()[-20:]) or "(MFannot produced no output)"
+        raise RuntimeError(
+            f"MFannot failed for {file_name} in {folder}\n"
+            f"  exit code: {proc.returncode}\n"
+            f"  .tbl files produced: {len(candidates)}\n"
+            f"  last lines of MFannot output:\n{tail}"
         )
     tbl_file = candidates[-1]
     shutil.move(tbl_file, folder / f"{file_name}.tbl")
