@@ -53,64 +53,75 @@ def reorder_fasta(fasta_file, strand, cut_pos, new_seq_name=None, old_seq_name=N
         f.write(header + "\n")
         f.write(seq + "\n")
         
-def reorder_fasta_by_rns(fasta_file, tbl_file, directory: str = "", keep_old=True):
+# HMM models shipped inside the MFannot image, used to locate rns cheaply
+RNS_MODELS = [
+    "/MFannot_data/models/HMM_models/RNA/5-rns-other.hmm",
+    "/MFannot_data/models/HMM_models/RNA/5-rns-fungi.hmm",
+]
+
+def find_rns_start(fasta_file, directory: str = "", evalue="1e-3"):
     """
-    Rotates a circular genome so that it starts with the small subunit ribosomal RNA (rns).
+    Locates the 5' end of rns with nhmmer, without running a full annotation.
+
+    Unlike MFannot, this also finds an rns that spans the origin of the linear
+    representation: MFannot discards a feature whose parts are not in
+    increasing coordinate order, whereas nhmmer scores each match on its own.
 
     Parameters:
     -----------
     fasta_file : str
-        Input FASTA file.
-    tbl_file : str
-        MFannot output table file containing feature coordinates.
+        Single-sequence FASTA file to search.
     directory : str or Path
-        Working directory.
-    keep_old : bool
-        If True, keeps the original non-rotated fasta as a backup.
+        Directory containing the file.
+    evalue : str
+        Reporting threshold passed to nhmmer.
 
-    Raises:
-    -------
-    ValueError
-        If 'rns' is not found or is already at position 1.
+    Returns:
+    --------
+    tuple or None
+        (strand, position) where position is the 1-based coordinate of the
+        first base of rns on that strand, or None if no match was found.
     """
-    seq_name = Path(fasta_file).stem
-    fasta_path = Path(directory, fasta_file)
+    path = Path(directory) / fasta_file
 
-    # Load annotation to locate features
-    annotation = mfannot_to_gff3(tbl_file, seq_name, export=False, directory=directory, organelle="")
+    length = 0
+    with open(path) as f:
+        for line in f:
+            if not line.startswith(">"):
+                length += len(line.strip())
 
-    mask = annotation['attributes'].str.contains("ID=rns", na=False)
-    if not mask.any():
-        raise ValueError("No rns found")
+    best = None
+    for model in RNS_MODELS:
+        if not Path(model).exists():
+            continue
+        proc = subprocess.run(
+            ["nhmmer", "--dna", "--tblout", "/dev/stdout", "-o", "/dev/null",
+             "-E", evalue, model, str(path)],
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            universal_newlines=True)
+        if proc.returncode != 0:
+            continue
+        for line in (proc.stdout or "").splitlines():
+            if line.startswith("#") or not line.strip():
+                continue
+            fields = line.split()
+            if len(fields) < 13:
+                continue
+            hmmfrom, alifrom, strand = int(fields[4]), int(fields[6]), fields[11]
+            score = float(fields[12])
+            if best is None or score < best[0]:
+                best = (score, hmmfrom, alifrom, strand)
 
-    if (annotation.loc[mask, "start"] == 1).any():
-        raise ValueError("rns already at position 1")
+    if best is None:
+        return None
 
-    rns_row = annotation.loc[mask].iloc[0]
-
-    with open(fasta_path) as f:
-        seq = "".join(line.strip() for line in f)
-        genome_length = len(seq)
-    
-    rns_length = rns_row['end'] - rns_row['start']
-    strand = rns_row['strand']
-
-    # Check if rns crosses the origin (will lead to large length)
-    if rns_length/genome_length > 0.5:
-        rns_split = True
-    else:
-        rns_split = False
-
-    # Determine cut position based on strand and whether gene is split
-    if not rns_split:
-        cut_pos = rns_row['start'] - 1 if strand == "+" else rns_row['end']
-    else:
-        strand = "-" if strand == "+" else "+"
-        cut_pos = rns_row['end'] - 1 if strand == "+" else rns_row['start']
-
-    old_seq_name = f"{seq_name}_old.fasta" if keep_old else None
-
-    reorder_fasta(fasta_file, strand, cut_pos, new_seq_name=fasta_file, old_seq_name=old_seq_name, directory=directory)
+    _, hmmfrom, alifrom, strand = best
+    # The match may start inside the model, so walk back to model position 1.
+    offset = hmmfrom - 1
+    start = alifrom - offset if strand == "+" else alifrom + offset
+    # Walking back can run off either end of a circular sequence.
+    start = ((start - 1) % length) + 1
+    return strand, start
 
 def annotate_mfannot(fasta_file, directory, organelle):
     """
@@ -814,49 +825,28 @@ def annotate_fasta(fasta_file, format, directory: str = "", organelle="", circul
             log(out, section)
 
         reordered = False
-        tbl_ready = False
 
         if circular:
-            reordered = True
-            # Annotate first attempt to find landmarks
-            run_mfannot(working_fasta, "MFannot (pass 1, locating rns)")
-
-            try:
-                reorder_fasta_by_rns(str(working_fasta), str(tbl_file), tmp_path, keep_old=False)
-
-            except ValueError as e:
-                msg = str(e)
-
-                # Case 1: no rns → rotate arbitrarily to avoid split features and try again
-                if msg == "No rns found":
-                    rotated_fasta = tmp_path / f"{fasta_stem}_rotated.fasta"
-                    rotated_tbl = tmp_path / f"{fasta_stem}_rotated.tbl"
-
-                    reorder_fasta(str(working_fasta), strand="+", cut_pos=3000, new_seq_name=str(rotated_fasta))
-                    run_mfannot(rotated_fasta, "MFannot (pass 1 retry, after blind rotation)")
-
-                    try:
-                        reorder_fasta_by_rns(str(rotated_fasta), str(rotated_tbl), tmp_path, keep_old=False)
-                        working_fasta.unlink()
-                        rotated_fasta.rename(working_fasta)
-                        tbl_file.unlink()
-                        rotated_tbl.rename(tbl_file)
-                    except ValueError:
-                        log(f"No rns found in {fasta_stem}, proceeding without reordering")
-                        reordered = False
-
-                # Case 2: rns already at start → use existing annotation
-                elif msg == "rns already at position 1":
-                    log(f"rns already at position 1 in {fasta_stem}, using existing annotation")
-                    reordered = False
-                    tbl_ready = True
-
+            # Locate rns with nhmmer rather than a full MFannot pass. MFannot
+            # loses any gene that spans the origin, so rns is invisible to it
+            # in exactly the case where rotation matters most.
+            hit = find_rns_start(working_fasta)
+            if hit is None:
+                log(f"No rns found in {fasta_stem}, proceeding without reordering")
+            else:
+                strand, start = hit
+                if strand == "+" and start == 1:
+                    log(f"rns already at position 1 in {fasta_stem}, no rotation needed")
                 else:
-                    raise
+                    cut_pos = start - 1 if strand == "+" else start
+                    reorder_fasta(str(working_fasta), strand=strand, cut_pos=cut_pos,
+                                  new_seq_name=str(working_fasta))
+                    reordered = True
+                    log(f"Rotated {fasta_stem} to start at rns "
+                        f"(strand {strand}, position {start})")
 
         # Generate final annotations
-        if not tbl_ready:
-            run_mfannot(working_fasta, "MFannot (final pass)")
+        run_mfannot(working_fasta, "MFannot")
         log(annotate_aragorn(str(working_fasta), tmp_path, organelle, circular), "Aragorn")
         
         mf_df = mfannot_to_gff3(str(tbl_file), fasta_stem, False, tmp_path, organelle)
