@@ -5,7 +5,9 @@ import subprocess
 from pathlib import Path
 import tempfile
 import shutil
+import warnings
 from Bio import SeqIO
+from Bio.Seq import Seq
 from BCBio import GFF
 
 # Functions
@@ -24,50 +26,32 @@ def fasta_contig_ids(fasta_file, directory: str = ""):
                 ids.append(line[1:].split()[0])
     return ids
 
-def reorder_fasta(fasta_file, strand, cut_pos, new_seq_name=None, old_seq_name=None, directory: str = ""):
+def reorder_sequence(seq, strand, cut_pos):
     """
     Reorders a circular sequence starting from a specific cut position
     and optionally adjusts the strand.
 
     Parameters:
     -----------
-    fasta_file : str
-        Name of the input FASTA file.
+    seq : str
+        The input nucleotide sequence string.
     strand : str
         Target strand ('+' or '-'). If '-', the sequence is reverse complemented.
     cut_pos : int
         The 0-based index at which to cut the sequence. The new sequence will start
         from this position.
-    new_seq_name : str, optional
-        Name for the output file. If None, it overwrites the input path (unless changed elsewhere).
-    old_seq_name : str, optional
-        Name to save the original sequence as backup.
-    directory : str or Path
-        Directory containing the files.
+
+    Returns:
+    --------
+    str
+        The rotated (and optionally reverse complemented) sequence string.
     """
-    fasta_path = Path(directory, fasta_file)
-    
-    with open(fasta_path) as f:
-        header = f.readline().strip()
-        seq = "".join(line.strip() for line in f)
-
     seq = seq[cut_pos:] + seq[:cut_pos]
-
     if strand == "-":
         complement = str.maketrans("ACGTacgt", "TGCAtgca")
         seq = seq.translate(complement)[::-1]
-    
-    if old_seq_name:
-        old_seq_path = Path(directory, old_seq_name)
-        fasta_path.rename(old_seq_path)
+    return seq
 
-    if new_seq_name:
-        fasta_path = Path(directory, new_seq_name)
-
-    with open(fasta_path, "w") as f:
-        f.write(header + "\n")
-        f.write(seq + "\n")
-        
 # HMM models shipped inside the MFannot image, used to locate rns cheaply
 RNS_MODELS = [
     "/MFannot_data/models/HMM_models/RNA/5-rns-other.hmm",
@@ -281,7 +265,6 @@ def mfannot_to_gff3(tbl_file, seq_name="Default_name", export=True, directory: s
             
         return empty_df
 
-
     # Parse features and their qualifiers, tracking which contig each belongs to
     features = []
     current_feature = None
@@ -416,7 +399,7 @@ def mfannot_to_gff3(tbl_file, seq_name="Default_name", export=True, directory: s
     df = pd.DataFrame(rows)
     df.columns = ["seqid", "source", "type", "start", "end", "score", "strand", "phase", "attributes"]
 
-    df = sort_gff3(df)
+    df = sort_gff3(df, contig_ids=contig_ids)
 
     if export:
         file_name = f"{directory}{seq_name}_MF.gff3"
@@ -736,7 +719,7 @@ def aragorn_to_gff3(txt_file, seq_name="Default_name", export=True, directory: s
 
     return gff_df
 
-def sort_gff3(gff3_object):
+def sort_gff3(gff3_object, contig_ids=None):
     """
     Sorts a GFF3 DataFrame based on a custom biological order and coordinates.
 
@@ -744,6 +727,8 @@ def sort_gff3(gff3_object):
     -----------
     gff3_object : pd.DataFrame
         The GFF3 data.
+    contig_ids : list of str, optional
+        Order of sequence IDs to respect when sorting.
 
     Returns:
     --------
@@ -755,7 +740,14 @@ def sort_gff3(gff3_object):
     gff3_object = gff3_object.copy()
     gff3_object['type'] = gff3_object['type'].astype(category_type)
     # Keep contigs grouped, in their order of first appearance (FASTA order)
-    seqid_order = list(dict.fromkeys(gff3_object['seqid']))
+    if contig_ids is not None:
+        seqid_order = [c for c in contig_ids if c in gff3_object['seqid'].values]
+        for s in dict.fromkeys(gff3_object['seqid']):
+            if s not in seqid_order:
+                seqid_order.append(s)
+    else:
+        seqid_order = list(dict.fromkeys(gff3_object['seqid']))
+
     gff3_object['seqid'] = pd.Categorical(gff3_object['seqid'],
                                           categories=seqid_order, ordered=True)
     gff3_object_sorted = gff3_object.sort_values(
@@ -764,7 +756,7 @@ def sort_gff3(gff3_object):
     )
     return gff3_object_sorted
 
-def merge_annotations(mfannot_gff3, aragorn_gff3, seq_name="Default_name", export=True, directory: str = ""):
+def merge_annotations(mfannot_gff3, aragorn_gff3, seq_name="Default_name", export=True, directory: str = "", contig_ids=None):
     """
     Merges MFannot and Aragorn GFF3 DataFrames.
     Aragorn tRNA predictions supersede MFannot tRNA predictions.
@@ -781,6 +773,8 @@ def merge_annotations(mfannot_gff3, aragorn_gff3, seq_name="Default_name", expor
         If True, writes the merged result to a file.
     directory : str or Path
         Output directory.
+    contig_ids : list of str, optional
+        Preserved contig order for sorting.
 
     Returns:
     --------
@@ -807,7 +801,7 @@ def merge_annotations(mfannot_gff3, aragorn_gff3, seq_name="Default_name", expor
     # 3. Only process and sort if there's data. Each feature keeps its own
     #    seqid, so multi-contig genomes stay separated by contig.
     if not merged_df.empty:
-        sorted_df = sort_gff3(merged_df)
+        sorted_df = sort_gff3(merged_df, contig_ids=contig_ids)
     else:
         sorted_df = merged_df
 
@@ -822,21 +816,24 @@ def merge_annotations(mfannot_gff3, aragorn_gff3, seq_name="Default_name", expor
 
     return sorted_df
 
-def annotate_fasta(fasta_file, format, directory: str = "", organelle="", circular=False, keep_old=True, keep_intermediates=False):
+def annotate_sequence(seq_file, format, directory: str = "", organelle="", circular=None, keep_old=True, keep_intermediates=False):
     """
-    Main pipeline: Annotates a FASTA file using MFannot and Aragorn.
-    Handles sequence rotation if the genome is circular.
+    Main pipeline: Annotates a FASTA or GenBank sequence file using MFannot and Aragorn.
+    Handles sequence rotation if circular sequences are present.
 
     Parameters:
     -----------
-    fasta_file : str
-        Input FASTA filename.
+    seq_file : str
+        Input FASTA or GenBank sequence filename.
+    format : str
+        Output format ('gb' or 'gff3').
     directory : str or Path
         Working directory containing the file.
     organelle : str
         Organelle type ('chloroplast' or 'mitochondrion').
-    circular : bool
-        If True, attempts to rotate the genome to start at rns.
+    circular : bool or None
+        If boolean, forces circular or linear topology. If None, topology is taken
+        from GenBank records or defaults to False (linear) for FASTA.
     keep_old : bool
         If True, keeps the original sequence file before rotation.
     keep_intermediates : bool
@@ -846,18 +843,35 @@ def annotate_fasta(fasta_file, format, directory: str = "", organelle="", circul
     import time
     start_time = time.time()
     
+    input_file_path = Path(directory) / seq_file
+    input_suffix = input_file_path.suffix.lower()
+
+    valid_fasta = {".fasta", ".fa", ".fna"}
+    valid_gb = {".gb", ".gbk", ".genbank"}
+    if input_suffix not in (valid_fasta | valid_gb):
+        raise ValueError(
+            f"Unsupported file format '{input_suffix}' for {seq_file}. "
+            f"Supported formats are FASTA ({', '.join(valid_fasta)}) and GenBank ({', '.join(valid_gb)})."
+        )
+    is_gb_input = input_suffix in valid_gb
+
     with tempfile.TemporaryDirectory() as tmpdir:
         tmp_path = Path(tmpdir)
-        
-        # Copy fasta to temp directory to work safely
-        input_fasta = Path(directory) / fasta_file
-        working_fasta = tmp_path / input_fasta.name
-        shutil.copy(input_fasta, working_fasta)
-        
-        fasta_stem = input_fasta.stem
-        tbl_file = tmp_path / f"{fasta_stem}.tbl"
+        seq_stem = input_file_path.stem
+        working_fasta = tmp_path / f"{seq_stem}.fasta"
 
-        log_path = Path(directory) / f"{fasta_stem}.log"
+        # Import GenBank or copy FASTA to temporary working FASTA
+        gb_records = {}
+        if is_gb_input:
+            for rec in SeqIO.parse(str(input_file_path), "genbank"):
+                rec.features = []  # Clear previous features, preserving annotations/metadata
+                gb_records[rec.id] = rec
+            SeqIO.write(list(gb_records.values()), str(working_fasta), "fasta")
+        else:
+            shutil.copy(input_file_path, working_fasta)
+        
+        tbl_file = tmp_path / f"{seq_stem}.tbl"
+        log_path = Path(directory) / f"{seq_stem}.log"
 
         def log(text, section=None):
             """Append to the run log, printing anything that is not tool output."""
@@ -870,7 +884,7 @@ def annotate_fasta(fasta_file, format, directory: str = "", organelle="", circul
                 print(text)
 
         log_path.write_text(
-            f"SOGA annotation of {fasta_file}\n"
+            f"SOGA annotation of {seq_file}\n"
             f"  started:    {time.strftime('%Y-%m-%d %H:%M:%S')}\n"
             f"  organelle:  {organelle}\n"
             f"  format:     {format}\n"
@@ -886,64 +900,120 @@ def annotate_fasta(fasta_file, format, directory: str = "", organelle="", circul
                 raise
             log(out, section)
 
-        # Real sequence IDs in FASTA order, used to give each feature the right
-        # seqid. reorder_fasta treats the file as a single sequence, so rotation
-        # is only attempted for single-contig genomes; annotation itself is
-        # contig-aware either way.
-        contig_ids = fasta_contig_ids(working_fasta)
-        # A fragmented assembly is a set of linear pieces, so --circular only
-        # takes effect for a single-sequence file.
-        treat_circular = circular and len(contig_ids) == 1
-        reordered = False
+        records_dict = {rec.id: rec for rec in SeqIO.parse(str(working_fasta), "fasta")}
+        contig_ids = list(records_dict.keys())
 
-        if circular and not treat_circular:
-            log(f"{fasta_stem}: {len(contig_ids)} contigs, annotating each "
-                f"without rotation to rns")
-        elif circular:
+        # Determine topology per contig and check for conflicts
+        is_circular = {}
+        for cid in contig_ids:
+            if is_gb_input:
+                rec_topo = gb_records[cid].annotations.get("topology", "linear").lower()
+                rec_is_circular = (rec_topo == "circular")
+                if circular is not None:
+                    if rec_is_circular != circular:
+                        msg = (
+                            f"Contig '{cid}' has contrasting topology '{rec_topo}' in {seq_file}, "
+                            f"using circular={circular} as specified."
+                        )
+                        warnings.warn(msg)
+                        log(f"WARNING: {msg}")
+                    is_circular[cid] = circular
+                else:
+                    is_circular[cid] = rec_is_circular
+            else:
+                is_circular[cid] = bool(circular) if circular is not None else False
+
+        # Reorder circular contigs to start at rns
+        reordered = False
+        for cid in contig_ids:
+            if not is_circular[cid]:
+                continue
+
+            single_tmp = tmp_path / "single_rns_check.fasta"
+            SeqIO.write(records_dict[cid], str(single_tmp), "fasta")
+
             # Locate rns with nhmmer rather than a full MFannot pass. MFannot
             # loses any gene that spans the origin, so rns is invisible to it
             # in exactly the case where rotation matters most.
-            hit = find_rns_start(working_fasta)
+            hit = find_rns_start(single_tmp.name, directory=tmp_path)
+
             if hit is None:
-                log(f"No rns found in {fasta_stem}, proceeding without reordering")
+                log(f"No rns found in contig {cid}, proceeding without reordering")
             else:
                 strand, start = hit
                 if strand == "+" and start == 1:
-                    log(f"rns already at position 1 in {fasta_stem}, no rotation needed")
+                    log(f"rns already at position 1 in contig {cid}, no rotation needed")
                 else:
                     cut_pos = start - 1 if strand == "+" else start
-                    reorder_fasta(str(working_fasta), strand=strand, cut_pos=cut_pos,
-                                  new_seq_name=str(working_fasta))
+                    new_seq_str = reorder_sequence(str(records_dict[cid].seq), strand=strand, cut_pos=cut_pos)
+                    
+                    records_dict[cid].seq = Seq(new_seq_str)
+                    if is_gb_input and cid in gb_records:
+                        gb_records[cid].seq = Seq(new_seq_str)
+
                     reordered = True
-                    log(f"Rotated {fasta_stem} to start at rns "
+                    log(f"Rotated contig {cid} to start at rns "
                         f"(strand {strand}, position {start})")
 
-        # Generate final annotations
+        if reordered:
+            SeqIO.write(list(records_dict.values()), str(working_fasta), "fasta")
+
+        # Generate final annotations: MFannot
         run_mfannot(working_fasta, "MFannot")
-        log(annotate_aragorn(str(working_fasta), tmp_path, organelle, circular), "Aragorn")
-        
-        mf_df = mfannot_to_gff3(str(tbl_file), fasta_stem, False, tmp_path, organelle,
+
+        # Generate final annotations: Aragorn
+        # If topologies are mixed, run separately for circular vs linear
+        has_circular = any(is_circular.values())
+        has_linear = any(not c for c in is_circular.values())
+
+        if has_circular and has_linear:
+            circ_records = [records_dict[cid] for cid in contig_ids if is_circular[cid]]
+            lin_records = [records_dict[cid] for cid in contig_ids if not is_circular[cid]]
+            
+            circ_fasta = tmp_path / f"{seq_stem}_circ.fasta"
+            SeqIO.write(circ_records, str(circ_fasta), "fasta")
+            log(annotate_aragorn(str(circ_fasta), tmp_path, organelle, circular=True), "Aragorn (circular)")
+            ar_circ_df = aragorn_to_gff3(f"{seq_stem}_circ.txt", seq_stem, False, tmp_path, organelle)
+            
+            lin_fasta = tmp_path / f"{seq_stem}_lin.fasta"
+            SeqIO.write(lin_records, str(lin_fasta), "fasta")
+            log(annotate_aragorn(str(lin_fasta), tmp_path, organelle, circular=False), "Aragorn (linear)")
+            ar_lin_df = aragorn_to_gff3(f"{seq_stem}_lin.txt", seq_stem, False, tmp_path, organelle)
+            
+            ar_df = pd.concat([ar_circ_df, ar_lin_df], ignore_index=True)
+            ar_df = sort_gff3(ar_df, contig_ids=contig_ids)
+        else:
+            all_circular = has_circular
+            log(annotate_aragorn(str(working_fasta), tmp_path, organelle, circular=all_circular), "Aragorn")
+            ar_df = aragorn_to_gff3(f"{seq_stem}.txt", seq_stem, False, tmp_path, organelle)
+
+        mf_df = mfannot_to_gff3(str(tbl_file), seq_stem, False, tmp_path, organelle,
                                 contig_ids=contig_ids)
-        ar_df = aragorn_to_gff3(f"{fasta_stem}.txt", fasta_stem, False, tmp_path, organelle)
         if mf_df.empty and ar_df.empty:
-            log(f"File {fasta_stem} has no features")
+            log(f"File {seq_stem} has no features")
             return
         else:
-            merge_annotations(mf_df, ar_df, fasta_stem, True, tmp_path)
+            merge_annotations(mf_df, ar_df, seq_stem, True, tmp_path, contig_ids=contig_ids)
         
-        #Export in adequate format
-        export_gff3 = tmp_path / f"{fasta_stem}.gff3"        
+        # Export in adequate format
+        export_gff3 = tmp_path / f"{seq_stem}.gff3"        
         
         if format == "gb":
-            # One GenBank record per contig, keyed by the seqid used in the GFF3
-            records = {}
-            for rec in SeqIO.parse(str(working_fasta), "fasta"):
-                rec.name = rec.id[:16]  # GenBank LOCUS name has a length cap
-                rec.annotations["molecule_type"] = "DNA"
-                # Without this the LOCUS line has no topology and readers
-                # default to linear.
-                rec.annotations["topology"] = "circular" if treat_circular else "linear"
-                records[rec.id] = rec
+            if is_gb_input:
+                # Reuse the input GenBank records preserving their annotations
+                records = gb_records
+                for rec_id, rec in records.items():
+                    rec.annotations["molecule_type"] = "DNA"
+                    rec.annotations["topology"] = "circular" if is_circular.get(rec_id, False) else "linear"
+            else:
+                # One GenBank record per contig, keyed by the seqid used in the GFF3
+                records = {}
+                for rec in SeqIO.parse(str(working_fasta), "fasta"):
+                    rec.name = rec.id[:16]  # GenBank LOCUS name has a length cap
+                    rec.annotations["molecule_type"] = "DNA"
+                    # Without this the LOCUS line has no topology and readers default to linear.
+                    rec.annotations["topology"] = "circular" if is_circular.get(rec.id, False) else "linear"
+                    records[rec.id] = rec
 
             with open(export_gff3) as gff_handle:
                 annotated = list(GFF.parse(gff_handle, base_dict=records))
@@ -958,23 +1028,37 @@ def annotate_fasta(fasta_file, format, directory: str = "", organelle="", circul
                         stack = list(f.sub_features) + stack
                 records[rec.id].features = flat
 
+            # If input file was reordered, back up original prior to writing new output
+            if reordered and keep_old and input_file_path.exists():
+                input_file_path.rename(Path(directory) / f"{seq_stem}_old{input_suffix}")
+
             SeqIO.write([records[i] for i in contig_ids if i in records],
-                        str(Path(directory) / f"{fasta_stem}.gb"), "gb")
+                        str(Path(directory) / f"{seq_stem}.gb"), "gb")
 
         elif format == "gff3":
-            gff3_dst = Path(directory) / f"{fasta_stem}.gff3"
+            gff3_dst = Path(directory) / f"{seq_stem}.gff3"
             shutil.move(export_gff3, gff3_dst)
 
-        # If the genome was rotated, the annotation coordinates refer to the
-        # rotated sequence, so it has to replace the input file. Whether the
-        # pre-rotation sequence is kept as a backup is a separate choice.
-        if reordered:
-            if keep_old:
-                input_fasta.rename(Path(directory) / f"{fasta_stem}_old.fasta")
-            shutil.move(working_fasta, Path(directory) / fasta_file)
+            # If the genome was rotated, the annotation coordinates refer to the
+            # rotated sequence, so it has to replace the input file. Whether the
+            # pre-rotation sequence is kept as a backup is a separate choice.
+            if reordered:
+                if keep_old and input_file_path.exists():
+                    input_file_path.rename(Path(directory) / f"{seq_stem}_old{input_suffix}")
+                if is_gb_input:
+                    SeqIO.write([gb_records[i] for i in contig_ids if i in gb_records],
+                                str(Path(directory) / seq_file), "gb")
+                else:
+                    shutil.move(working_fasta, Path(directory) / seq_file)
+
+        if reordered and not is_gb_input and format == "gb":
+            if keep_old and input_file_path.exists():
+                input_file_path.rename(Path(directory) / f"{seq_stem}_old{input_suffix}")
+            shutil.move(working_fasta, Path(directory) / seq_file)
 
         if keep_intermediates:
-            for src in (tmp_path / f"{fasta_stem}.tbl", tmp_path / f"{fasta_stem}.txt"):
+            for filename in [f"{seq_stem}.tbl", f"{seq_stem}.txt", f"{seq_stem}_circ.txt", f"{seq_stem}_lin.txt"]:
+                src = tmp_path / filename
                 if src.exists():
                     shutil.copy(src, Path(directory) / src.name)
 
