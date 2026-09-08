@@ -146,10 +146,13 @@ def annotate_mfannot(fasta_file, directory, organelle):
         genetic_code = None
     
     # Run MFannot
-    proc = subprocess.run([
-        "sh", "-c",
-        f"cd {folder} && /mfannot/mfannot -g {genetic_code} --tbl {file_name}.fasta"
-    ], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, universal_newlines=True)
+    proc = subprocess.run(
+        ["mfannot", "-g", str(genetic_code), "--tbl", f"{file_name}.fasta"],
+        cwd=folder,                      # <-- Replaces "cd {folder} &&"
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True                        # Modern replacement for universal_newlines=True
+    )
 
     candidates = sorted(folder.glob(f"{file_name}.fasta.new*.tbl"))
     if proc.returncode != 0 or not candidates:
@@ -206,7 +209,7 @@ def annotate_aragorn(fasta_file, directory, organelle, circular=True):
         "-w",       # batch mode
         "-o", f"{folder}/{file_name}.txt",
         f"{folder}/{file_name}.fasta"
-    ], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, universal_newlines=True)
+    ], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
 
     if proc.returncode != 0:
         log = (proc.stdout or "").strip()
