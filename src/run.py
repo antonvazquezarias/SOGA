@@ -19,7 +19,11 @@ def main():
     )
     parser.add_argument(
         "--directory", default="/data",
-        help="Working directory containing the input and output files (default: /data)"
+        help="Directory containing the input file (default: /data)"
+    )
+    parser.add_argument(
+        "-o", "--output-dir", dest="output_dir", default=None,
+        help="Directory where output files will be written (default: same as --directory)"
     )
     parser.add_argument(
         "--circular", dest="circular", action="store_true", default=None,
@@ -48,6 +52,7 @@ def main():
         circular=args.circular,
         keep_old=args.keep_old,
         keep_intermediates=args.keep_intermediates,
+        output_dir=args.output_dir,
     )
 
 if __name__ == "__main__":
