@@ -293,7 +293,6 @@ def mfannot_to_gff3(tbl_file, seq_name="Default_name", export=True, directory: s
             current_feature["qualifiers"].append(elements)
 
     rows = []
-    ID_count = defaultdict(int)
     gene_ID = feature_ID = None
     cumulative_CDS_length = 0
 
@@ -348,16 +347,7 @@ def mfannot_to_gff3(tbl_file, seq_name="Default_name", export=True, directory: s
         if row_type == "RNA":
             row_type = "ncRNA"
 
-        # Handle duplicate feature IDs
-        ID_count[ID] += 1
-        if ID_count[ID] > 1:
-            qualifiers_dict["ID"] = f"{ID}{ID_count[ID]}"
-            if row_type == "gene":
-                gene_ID = f"{ID}{ID_count[ID]}"
-            elif row_type not in ["gene", "intron", "exon"]:
-                feature_ID = f"{ID}{ID_count[ID]}"
-        else:
-            qualifiers_dict["ID"] = ID
+        qualifiers_dict["ID"] = ID
 
         # Calculate Phase for CDS
         phase = "."
@@ -542,7 +532,6 @@ def aragorn_to_gff3(txt_file, seq_name="Default_name", export=True, directory: s
 
     # Construct GFF3 rows
     gff_rows = []
-    name_counter = defaultdict(int)
 
     aminoacids = {
         "Ala": "A", "Arg": "R", "Asn": "N", "Asp": "D", "Cys": "C",
@@ -561,8 +550,7 @@ def aragorn_to_gff3(txt_file, seq_name="Default_name", export=True, directory: s
         else:
             gene_base = row['type']
 
-        name_counter[gene_base] += 1
-        gene_id = gene_base if name_counter[gene_base] == 1 else f"{gene_base}{name_counter[gene_base]}"
+        gene_id = gene_base
         tmRNA_id = f"{gene_id}_tmRNA"
 
         gff_rows.append({
@@ -788,7 +776,7 @@ def merge_annotations(mfannot_gff3, aragorn_gff3, seq_name="Default_name", expor
     # Remove tRNAs from the MFannot object (Aragorn is preferred for tRNAs)
     # 1. Filter MFannot tRNAs safely
     if not mfannot_gff3.empty:
-        filtered_mf = mfannot_gff3.loc[~mfannot_gff3['attributes'].str.contains("ID=trn", na=False)]
+        filtered_mf = mfannot_gff3.loc[~mfannot_gff3['attributes'].str.contains(r"(?:ID|parent)=trn", na=False)]
     else:
         filtered_mf = mfannot_gff3
 
@@ -796,20 +784,72 @@ def merge_annotations(mfannot_gff3, aragorn_gff3, seq_name="Default_name", expor
     if filtered_mf.empty and aragorn_gff3.empty:
         merged_df = filtered_mf.copy() # Keeps the column structure
     elif filtered_mf.empty:
-        merged_df = aragorn_gff3.copy()
+        merged_df = aragorn_gff3.copy().reset_index(drop=True)
     elif aragorn_gff3.empty:
-        merged_df = filtered_mf.copy()
+        merged_df = filtered_mf.copy().reset_index(drop=True)
     else:
         merged_df = pd.concat([filtered_mf, aragorn_gff3], ignore_index=True)
 
-    # 3. Only process and sort if there's data. Each feature keeps its own
+    # 3. Disambiguate duplicate IDs across sequences and within sequences
+    if not merged_df.empty:
+        gene_indices = merged_df.index[merged_df['type'] == 'gene'].tolist()
+        gene_occurrences = defaultdict(lambda: defaultdict(list))
+
+        # Pass 1: Map where each gene appears across all sequences
+        for idx in gene_indices:
+            attr = merged_df.at[idx, 'attributes']
+            match = re.search(r"(?:^|;)ID=([^;]+)", attr)
+            base_id = match.group(1) if match else "unknown_gene"
+            seqid = merged_df.at[idx, 'seqid']
+            gene_occurrences[base_id][seqid].append(idx)
+
+        # Pass 2: Compute disambiguated IDs and cascade strictly to ID and parent
+        for base_id, seq_dict in gene_occurrences.items():
+            multi_seq = len(seq_dict) > 1
+
+            for seqid, idx_list in seq_dict.items():
+                multi_in_seq = len(idx_list) > 1
+
+                for copy_num, g_idx in enumerate(idx_list, start=1):
+                    # Add {seqid}_ prefix if present in multiple sequences; add _1, _2 suffix if multiple on this sequence
+                    prefix = f"{seqid}_" if multi_seq else ""
+                    suffix = f"_{copy_num}" if multi_in_seq else ""
+                    new_gene_id = f"{prefix}{base_id}{suffix}"
+
+                    if new_gene_id == base_id:
+                        continue  # Globally unique, leave unmodified
+
+                    g_start = merged_df.at[g_idx, 'start']
+                    g_end = merged_df.at[g_idx, 'end']
+
+                    # Target only ID= and parent=/Parent= fields, leaving name= and gene= untouched
+                    pattern = re.compile(rf"((?:^|;)(?:ID|parent|Parent)=){re.escape(base_id)}(?=[;_]|$)")
+
+                    # Update the parent gene row ID
+                    old_attr = merged_df.at[g_idx, 'attributes']
+                    merged_df.at[g_idx, 'attributes'] = pattern.sub(rf"\g<1>{new_gene_id}", old_attr)
+
+                    # Update child feature ID and parent references within the gene span
+                    candidate_mask = (
+                        (merged_df['seqid'] == seqid) &
+                        (merged_df['start'] >= g_start) &
+                        (merged_df['end'] <= g_end) &
+                        (merged_df.index != g_idx) &
+                        (merged_df['attributes'].str.contains(rf"(?:ID|parent|Parent)={re.escape(base_id)}", regex=True, na=False))
+                    )
+
+                    for child_idx in merged_df.index[candidate_mask]:
+                        c_attr = merged_df.at[child_idx, 'attributes']
+                        merged_df.at[child_idx, 'attributes'] = pattern.sub(rf"\g<1>{new_gene_id}", c_attr)
+
+    # 4. Only process and sort if there's data. Each feature keeps its own
     #    seqid, so multi-contig genomes stay separated by contig.
     if not merged_df.empty:
         sorted_df = sort_gff3(merged_df, contig_ids=contig_ids)
     else:
         sorted_df = merged_df
 
-    # 4. Standard GFF3 export
+    # 5. Standard GFF3 export
     if export:
         file_name = Path(directory) / f"{seq_name}.gff3"
         with open(file_name, "w") as f:
