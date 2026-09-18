@@ -3,6 +3,7 @@ FROM ubuntu:26.04
 LABEL maintainer="Pipeline Maintainer"
 
 ENV DEBIAN_FRONTEND=noninteractive
+ENV PYTHONUNBUFFERED=1
 
 # ----------------------------------------------------------------------
 # 1. System & Bioinformatics Dependencies (APT)
