@@ -1,5 +1,5 @@
-import pandas as pd
-from collections import defaultdict
+from collections import defaultdict, Counter
+from dataclasses import dataclass, field
 import re
 import subprocess
 from pathlib import Path
@@ -10,7 +10,7 @@ import shutil
 import warnings
 from Bio import SeqIO
 from Bio.Seq import Seq
-from BCBio import GFF
+from Bio.SeqFeature import SeqFeature, FeatureLocation, CompoundLocation
 
 # Functions
 def fasta_contig_ids(fasta_file, directory: str = ""):
@@ -124,7 +124,7 @@ def find_rns_start(fasta_file, directory: str = "", evalue="1e-3"):
     start = ((start - 1) % length) + 1
     return strand, start
 
-def annotate_mfannot(fasta_file, directory, organelle):
+def annotate_mfannot(fasta_file, directory, genetic_code):
     """
     Runs MFannot using a Docker container to annotate the sequence.
 
@@ -134,19 +134,12 @@ def annotate_mfannot(fasta_file, directory, organelle):
         Input FASTA file.
     directory : str or Path
         Directory containing the file (will be mounted to Docker).
-    organelle : str
-        Type of organelle ('chloroplast' or 'mitochondrion') to determine genetic code.
+    genetic_code : int
+        NCBI translation table (e.g. 11 for plastids, 4 for mitochondria).
     """
     folder = Path(directory).resolve()
     file_name = Path(fasta_file).stem
 
-    if organelle.lower() == "chloroplast":
-        genetic_code = 11
-    elif organelle.lower() in ["mitochondrion", "mitochondria"]:
-        genetic_code = 4
-    else:
-        genetic_code = None
-    
     # Run MFannot
     proc = subprocess.run(
         ["mfannot", "-g", str(genetic_code), "--tbl", f"{file_name}.fasta"],
@@ -170,7 +163,7 @@ def annotate_mfannot(fasta_file, directory, organelle):
     shutil.move(tbl_file, folder / f"{file_name}.tbl")
     return proc.stdout or ""
 
-def annotate_aragorn(fasta_file, directory, organelle, circular=True):
+def annotate_aragorn(fasta_file, directory, genetic_code, circular=True):
     """
     Runs Aragorn using a Docker container to identify tRNAs and tmRNAs.
 
@@ -180,21 +173,14 @@ def annotate_aragorn(fasta_file, directory, organelle, circular=True):
         Input FASTA file.
     directory : str or Path
         Directory containing the file.
-    organelle : str
-        Organelle type for genetic code selection.
+    genetic_code : int
+        NCBI translation table (e.g. 11 for plastids, 4 for mitochondria).
     circular : bool
         Topology of the sequence. True for circular, False for linear.
     """
     folder = Path(directory).resolve()
     file_name = Path(fasta_file).stem
 
-    if organelle.lower() == "chloroplast":
-        genetic_code = 11
-    elif organelle.lower() in ["mitochondrion", "mitochondria"]:
-        genetic_code = 4
-    else:
-        genetic_code = None
-    
     if circular:
         topology = "c"
     else:
@@ -223,317 +209,239 @@ def annotate_aragorn(fasta_file, directory, organelle, circular=True):
         )
     return proc.stdout or ""
 
-def mfannot_to_gff3(tbl_file, seq_name="Default_name", export=True, directory: str = "", organelle="", contig_ids=None):
+# ============================================================
+# Annotation model
+# ============================================================
+# The parsers turn MFannot and Aragorn output into a list of Gene objects,
+# merging works on that list, and GFF3 or GenBank output is written from it
+# at the very end. A child is linked to its parent by being stored inside it,
+# not by an ID string, so two genes with the same name can never be confused.
+# GFF3 IDs are only created when writing the file.
+
+@dataclass(eq=False)
+class Feature:
     """
-    Parses MFannot .tbl output and converts it to GFF3 format.
+    Something annotated inside a gene: CDS, tRNA, rRNA, tmRNA, exon, intron...
+
+    parts holds one (start, end) pair per segment, 1-based and inclusive,
+    with start <= end. Segments are listed 5' to 3', so in descending order
+    on the minus strand. A tRNA interrupted by an intron is ONE Feature with
+    two parts, not two features.
+    """
+    type: str
+    parts: list
+    strand: str
+    attrs: dict = field(default_factory=dict)
+    children: list = field(default_factory=list)
+    score: float | None = None
+
+
+@dataclass(eq=False)
+class Gene:
+    """A gene and everything annotated inside it (in children)."""
+    seqid: str
+    source: str
+    name: str
+    parts: list
+    strand: str
+    attrs: dict = field(default_factory=dict)
+    children: list = field(default_factory=list)
+
+
+def get_gene_features(gene):
+    """
+    Returns every feature inside a gene (its children, their children, and
+    so on) as a flat list, each parent before its children.
+    """
+    features = []
+    pending = list(gene.children)
+    while pending:
+        feat = pending.pop(0)
+        features.append(feat)
+        pending = feat.children + pending
+    return features
+
+
+# Order of feature types that start at the same position, used when sorting output
+TYPE_ORDER = {"gene": 0, "ncRNA": 1, "rRNA": 2, "tmRNA": 3, "CDS": 4, "tRNA": 5, "intron": 6, "exon": 7}
+
+
+# ============================================================
+# Parsers
+# ============================================================
+
+def parse_mfannot(tbl_file, genetic_code=None, contig_ids=None, seq_name="Default_name"):
+    """
+    Parses MFannot .tbl output into a list of Gene objects.
 
     Parameters:
     -----------
-    tbl_file : str
-        Name of the MFannot .tbl file.
-    seq_name : str
-        Fallback sequence identifier, used when contig_ids is not given.
-    export : bool
-        If True, writes the result to a .gff3 file.
-    directory : str or Path
-        Working directory.
-    organelle : str
-        Used to set translation table attributes.
+    tbl_file : str or Path
+        Path to the MFannot .tbl file.
+    genetic_code : int, optional
+        Written as transl_table on CDS features.
     contig_ids : list of str, optional
         Real sequence IDs in FASTA order. MFannot renames contigs to C_0, C_1,
         ... in that order, so the Nth ">Feature" section is given
         contig_ids[N]. If None, seq_name is used for every feature.
+    seq_name : str
+        Fallback sequence identifier.
 
     Returns:
     --------
-    pd.DataFrame
-        DataFrame containing the GFF3 data.
+    list of Gene
     """
+    def qualifiers_to_attrs(qual):
+        """Converts MFannot qualifier lines into an attribute dict."""
+        # MFannot writes transl_except as "(pos:21144..21146, aa : Q)"; the
+        # INSDC format is "(pos:21144..21146,aa:Gln)"
+        three_letter = {
+            "A": "Ala", "R": "Arg", "N": "Asn", "D": "Asp", "C": "Cys",
+            "Q": "Gln", "E": "Glu", "G": "Gly", "H": "His", "I": "Ile",
+            "L": "Leu", "K": "Lys", "M": "Met", "F": "Phe", "P": "Pro",
+            "S": "Ser", "T": "Thr", "W": "Trp", "Y": "Tyr", "V": "Val",
+            "U": "Sec", "O": "Pyl", "*": "TERM"
+        }
+        attrs = {}
+        for q in qual:
+            if len(q) < 5:
+                continue
+            key, val = q[3], q[4]
+            # Skip gene names containing "orf"
+            if key == "gene" and "orf" in val:
+                continue
+            if key == "protein_id":
+                val = val.replace("lcl| ", "")
+            if key == "transl_except":
+                match = re.match(r"\(pos:\s*(\S+?)\s*,\s*aa\s*:\s*(\S+?)\s*\)", val)
+                if match:
+                    aa = three_letter.get(match.group(2), match.group(2))
+                    val = f"(pos:{match.group(1)},aa:{aa})"
+            attrs[key] = val
+        return attrs
 
-    gff_columns = ["seqid", "source", "type", "start", "end", "score", "strand", "phase", "attributes"]
-    # A table holds one section per contig, each introduced by a
-    # ">Feature C_<n> ..." line in FASTA order.
-    with open(Path(directory) / tbl_file) as f:
+    with open(tbl_file) as f:
         raw_lines = f.read().splitlines()
 
-    lines = [l for l in raw_lines if l.strip() and not l.startswith(">")]
-
-    if len(lines) == 0:
-        empty_df = pd.DataFrame(columns=gff_columns)
-        
-        if export:
-            file_name = Path(directory) / f"{seq_name}_MF.gff3"
-            with open(file_name, "w") as f:
-                f.write("##gff-version 3\n")
-            # This ensures the file exists and is valid GFF3 even if empty
-            empty_df.to_csv(file_name, sep="\t", header=False, index=False, mode="a")
-            
-        return empty_df
-
-    # Parse features and their qualifiers, tracking which contig each belongs to
-    features = []
-    current_feature = None
+    # Pass 1: group each feature line with the qualifier lines below it, and
+    # record which contig section (">Feature C_<n> ...") it belongs to.
+    entries = []
+    current = None
     contig_index = -1
-
     for line in raw_lines:
         if not line.strip():
             continue
         if line.startswith(">"):
-            # ">Feature C_<n> Table1": trust the number MFannot writes rather
-            # than counting sections, so a missing section cannot shift the map.
+            # Trust the number MFannot writes rather than counting sections,
+            # so a missing section cannot shift the map.
             match = re.match(r">Feature\s+C_(\d+)", line)
             contig_index = int(match.group(1)) if match else contig_index + 1
-            current_feature = None
+            current = None
             continue
         elements = line.split("\t")
         if elements[0]:
-            current_feature = {"feature": elements, "qualifiers": [],
-                               "contig_index": contig_index}
-            features.append(current_feature)
-        elif current_feature is not None:
-            current_feature["qualifiers"].append(elements)
+            current = {"feature": elements, "qualifiers": [], "contig_index": contig_index}
+            entries.append(current)
+        elif current is not None:
+            current["qualifiers"].append(elements)
 
-    rows = []
-    gene_ID = feature_ID = None
-    cumulative_CDS_length = 0
+    # Pass 2: build genes. In the .tbl format, a feature made of several
+    # segments is written as one line with a type followed by lines without
+    # one, and its qualifiers come after the last segment.
+    genes = []
+    gene = None           # gene being filled
+    feature = None        # latest CDS/rRNA/tRNA... of that gene; introns and exons go inside it
+    last = None           # latest gene or feature created, extended by continuation lines
+    previous_type = ""
 
-    for feat in features:
-        f = feat["feature"]
-        qual = feat["qualifiers"]
-
-        # Map this feature onto its real sequence ID via the contig section order
-        ci = feat["contig_index"]
+    for entry in entries:
+        f, qual = entry["feature"], entry["qualifiers"]
+        ci = entry["contig_index"]
         seqid = contig_ids[ci] if (contig_ids and 0 <= ci < len(contig_ids)) else seq_name
 
-        # Safe extraction of row_type (inherit from previous if missing)
-        if len(f) > 2 and f[2]:
+        # A new contig section never continues the previous gene
+        if gene is not None and gene.seqid != seqid:
+            gene = feature = last = None
+
+        # Feature type. Some ORFs come without a type and are recognized by
+        # their protein_id (which MFannot builds from the gene name, e.g.
+        # "lcl| G-ycf3"); any other line without a type continues the
+        # previous feature.
+        has_type = len(f) > 2 and bool(f[2])
+        protein_id = next((q[4] for q in qual if len(q) >= 5 and q[3] == "protein_id"), "")
+        if has_type:
             row_type = f[2]
-        elif qual and len(qual[0]) >= 5 and "ycf" in qual[1][4]:
+        elif "ycf" in protein_id:
             row_type = "CDS"
             qual[0][4] = "hypothetical protein"
-        elif qual and len(qual[0]) >= 5 and "rnz" in qual[1][4]:
+        elif "rnz" in protein_id:
             row_type = "CDS"
             qual[0][4] = "Ribonuclease Z"
-        elif qual and len(qual[0]) >= 5 and "odp" in qual[1][4].lower():
+        elif "odp" in protein_id.lower():
             row_type = "CDS"
-            if "odpa" in qual[1][4].lower():
+            if "odpa" in protein_id.lower():
                 qual[0][4] = "Pyruvate dehydrogenase E1 component subunit alpha"
-            elif "odpb" in qual[1][4].lower():
+            elif "odpb" in protein_id.lower():
                 qual[0][4] = "Pyruvate dehydrogenase E1 component subunit beta"
         else:
-            row_type = rows[-1][2] if rows else ""
-        
-        # Determine start/end and strand based on coordinate order
-        start, end = (int(f[0]), int(f[1])) if len(f) > 1 and int(f[0]) < int(f[1]) else (int(f[1]), int(f[0]))
-        strand = "+" if int(f[0]) < int(f[1]) else "-"
-
-        qualifiers_dict = {}
-
-        # Construct IDs and Names based on feature type
-        if row_type == "gene":
-            gene_ID = qual[0][4] if qual else "gene_unknown"
-            ID = gene_ID
-            qualifiers_dict["name"] = f"{gene_ID} gene"
-            cumulative_CDS_length = 0
-        elif row_type not in ["gene", "intron", "exon"]:
-            feature_ID = f"{gene_ID}_{row_type}"
-            ID = feature_ID
-            qualifiers_dict["name"] = f"{gene_ID} {row_type}"
-            qualifiers_dict["parent"] = gene_ID
-        else:
-            ID = f"{gene_ID}_{row_type}"
-            qualifiers_dict["name"] = f"{gene_ID} {row_type}"
-            qualifiers_dict["parent"] = feature_ID
-        
+            row_type = previous_type
         if row_type == "RNA":
             row_type = "ncRNA"
 
-        qualifiers_dict["ID"] = ID
+        is_continuation = not has_type and last is not None and row_type == previous_type
+        previous_type = row_type
 
-        # Calculate Phase for CDS
-        phase = "."
-        if row_type == "CDS":
-            phase = (3 - (cumulative_CDS_length % 3)) % 3
-            cumulative_CDS_length += end - start + 1
-            
-            if organelle.lower() == "chloroplast":
-                qualifiers_dict["transl_table"] = 11
-            elif organelle.lower() in ["mitochondrion", "mitochondria"]:
-                qualifiers_dict["transl_table"] = 4
+        # Coordinates: MFannot writes minus-strand features as end..start
+        a, b = int(f[0]), int(f[1])
+        start, end = min(a, b), max(a, b)
+        strand = "+" if a < b else "-"
 
-        # Parse original MFannot qualifiers
-        for q in qual:
-            if len(q) < 5:
-                continue
+        attrs = qualifiers_to_attrs(qual)
 
-            key = q[3]
-            val = q[4]
+        if is_continuation:
+            last.parts.append((start, end))
+            last.attrs.update(attrs)
+            if last is gene and gene.name == "gene_unknown" and qual:
+                gene.name = qual[0][4]
+        elif row_type == "gene":
+            name = qual[0][4] if qual else "gene_unknown"
+            gene = Gene(seqid, "MFannot", name, [(start, end)], strand, attrs)
+            genes.append(gene)
+            feature = None
+            last = gene
+        elif gene is None:
+            continue  # MFannot always writes the gene line first
+        elif row_type in ("intron", "exon"):
+            last = Feature(row_type, [(start, end)], strand, attrs)
+            parent = feature if feature is not None else gene
+            parent.children.append(last)
+        else:
+            if row_type == "CDS" and genetic_code:
+                attrs = {"transl_table": genetic_code, **attrs}
+            feature = last = Feature(row_type, [(start, end)], strand, attrs)
+            gene.children.append(feature)
 
-            # Skip gene names containing "orf" or Clean protein IDs
-            if key == "gene" and "orf" in val:
-                continue
-            if key == "protein_id":
-                qualifiers_dict[key] = val.replace("lcl| ","")
-                continue
+    return genes
 
-            qualifiers_dict[key] = val
 
-        row = [
-            seqid,
-            "MFannot",
-            row_type,
-            start,
-            end,
-            ".",
-            strand,
-            phase,
-            ";".join(f"{k}={v}" for k, v in qualifiers_dict.items())
-        ]
-        rows.append(row)
-
-    df = pd.DataFrame(rows)
-    df.columns = ["seqid", "source", "type", "start", "end", "score", "strand", "phase", "attributes"]
-
-    df = sort_gff3(df, contig_ids=contig_ids)
-
-    if export:
-        file_name = f"{directory}{seq_name}_MF.gff3"
-        with open(file_name, "w") as f:
-            f.write("##gff-version 3\n")
-        df.to_csv(file_name, sep="\t", header=False, index=False, mode="a")
-
-    return df
-
-def aragorn_to_gff3(txt_file, seq_name="Default_name", export=True, directory: str = "", organelle=""):
+def parse_aragorn(txt_file, genetic_code=None, seq_name="Default_name"):
     """
-    Parses Aragorn output text file and converts it to GFF3 format.
+    Parses Aragorn batch (-w) output into a list of Gene objects.
 
     Parameters:
     -----------
-    txt_file : str
-        Name of the Aragorn output file.
+    txt_file : str or Path
+        Path to the Aragorn output file.
+    genetic_code : int, optional
+        Written as transl_table on the tmRNA coding region.
     seq_name : str
         Fallback sequence identifier, used only if a data row precedes any
         contig header, which does not happen in normal Aragorn output.
-    export : bool
-        If True, writes the result to a .gff3 file.
-    directory : str or Path
-        Working directory.
-    organelle : str
-        Used to set translation table attributes for tmRNA.
 
     Returns:
     --------
-    pd.DataFrame
-        DataFrame containing the GFF3 data.
+    list of Gene
     """
-    gff_columns = ["seqid", "source", "type", "start", "end", "score", "strand", "phase", "attributes"]
-
-    # Batch (-w) output holds one section per contig:
-    #   >contig_id len=...
-    #   N genes found
-    #   1  tRNA-Xxx  [a,b]  pos  (codon)
-    # and closes with a ">end ..." line. Keep the contig id for every data row,
-    # since a contig with no genes must not discard the others.
-    with open(Path(directory) / txt_file) as f:
-        raw_lines = f.read().splitlines()
-
-    seqids = []
-    data_rows = []
-    current_seqid = seq_name
-    for line in raw_lines:
-        stripped = line.strip()
-        if not stripped:
-            continue
-        if stripped.startswith(">"):
-            if not stripped.startswith(">end"):
-                current_seqid = stripped[1:].split()[0]
-            continue
-        if stripped.endswith("genes found"):
-            continue
-        seqids.append(current_seqid)
-        data_rows.append(re.sub(r"[ \t]+", " ", stripped).split(" "))
-
-    if not data_rows:
-        empty_df = pd.DataFrame(columns=gff_columns)
-
-        if export:
-            file_name = Path(directory) / f"{seq_name}_AR.gff3"
-            with open(file_name, "w") as f:
-                f.write("##gff-version 3\n")
-            # This ensures the file exists and is valid GFF3 even if empty
-            empty_df.to_csv(file_name, sep="\t", header=False, index=False, mode="a")
-
-        return empty_df
-
-    df = pd.DataFrame(data_rows)
-    df['seqid'] = seqids
-
-    # Cleaning and Pre-processing columns. Column 0 is Aragorn's per-section
-    # row number, which restarts on every contig.
-    df = df.drop(columns=0).reset_index(drop=True)
-    df['strand'] = df[2].str.startswith('c').map({True: '-', False: '+'})
-    
-    start_end = df[2].str.extract(r'c?\[(\d+),(\d+)\]')
-    df['start'] = pd.to_numeric(start_end[0], errors='coerce')
-    df['end'] = pd.to_numeric(start_end[1], errors='coerce')
-    
-    intron_match = df[4].str.extract(r'i\((\d+),(\d+)\)')
-    df['intron_distance'] = pd.to_numeric(intron_match[0], errors='coerce')
-    df['intron_length'] = pd.to_numeric(intron_match[1], errors='coerce')
-    
-    df[4] = df[4].str.replace(r'i\(\d+,\d+\)', '', regex=True).str.strip()
-    
-    type_aa = df[1].str.split('-', n=1, expand=True)
-    df['type'] = type_aa[0]
-    df['aminoacid'] = type_aa[1]
-    
-    df = df.rename(columns={4: 'codon', 3: 'position'})
-    
-    # Calculate relative start/end for tmRNA and tRNA features
-    df['feature_start'] = pd.NA
-    df['feature_end'] = pd.NA
-
-    for idx, row in df.iterrows():
-        raw = row['position']
-        if row['type'] == 'tmRNA':
-            rel_start, rel_end = map(int, str(raw).split(','))
-            if row['strand'] == '+':
-                df.at[idx, 'feature_start'] = row['start'] + rel_start - 1
-                df.at[idx, 'feature_end']   = row['start'] + rel_end   - 1
-            else:
-                df.at[idx, 'feature_start'] = row['end'] - rel_end   + 1
-                df.at[idx, 'feature_end']   = row['end'] - rel_start + 1
-        elif row['type'] == 'tRNA':
-            raw = int(raw)
-            if row['strand'] == '+':
-                df.at[idx, 'feature_start'] = row['start'] + raw - 1
-                df.at[idx, 'feature_end']   = row['start'] + raw + 1
-            else:
-                df.at[idx, 'feature_start']   = row['end'] - raw - 1
-                df.at[idx, 'feature_end'] = row['end'] - raw + 1
-            
-    # Compute absolute intron coordinates
-    df['intron_start'] = pd.NA
-    df['intron_end'] = pd.NA
-
-    for idx, row in df.iterrows():
-        if pd.notna(row['intron_distance']):
-            if row['strand'] == '+':
-                df.at[idx, 'intron_start'] = row['start'] + row['intron_distance'] - 1
-                df.at[idx, 'intron_end'] = row['start'] + row['intron_distance'] + row['intron_length'] - 2
-            else:
-                df.at[idx, 'intron_end'] = row['end'] - row['intron_distance'] + 1
-                df.at[idx, 'intron_start'] = row['end'] - row['intron_distance'] - row['intron_length'] + 2
-    
-    numeric_cols = ['start', 'end', 'position', 'intron_distance', 'intron_length']
-    df[numeric_cols] = df[numeric_cols].apply(pd.to_numeric, errors='coerce')
-
-    df = df[['seqid', 'type', 'start', 'end', 'strand', 'codon', 'aminoacid', 'feature_start', 'feature_end', 'intron_start', 'intron_end']]
-
-    # Construct GFF3 rows
-    gff_rows = []
-
     aminoacids = {
         "Ala": "A", "Arg": "R", "Asn": "N", "Asp": "D", "Cys": "C",
         "Gln": "Q", "Glu": "E", "Gly": "G", "His": "H", "Ile": "I",
@@ -542,324 +450,249 @@ def aragorn_to_gff3(txt_file, seq_name="Default_name", export=True, directory: s
         "Sec": "U", "Pyl": "O"
     }
 
-    for idx, row in df.iterrows():
-        # Gene logic
-        if row['type'] == "tRNA":
-            gene_base = f"trn{aminoacids.get(str(row['aminoacid']), '')}{row['codon']}"
-        elif row['type'] == "tmRNA":
-            gene_base = "ssrA"
+    with open(txt_file) as f:
+        raw_lines = f.read().splitlines()
+
+    # Batch (-w) output holds one section per contig:
+    #   >contig_id len=...
+    #   N genes found
+    #   1  tRNA-Xxx  [a,b]  pos  (codon)
+    # and closes with a ">end ..." line. Keep the contig id for every data row,
+    # since a contig with no genes must not discard the others.
+    genes = []
+    seqid = seq_name
+    for line in raw_lines:
+        stripped = line.strip()
+        if not stripped:
+            continue
+        if stripped.startswith(">"):
+            if not stripped.startswith(">end"):
+                seqid = stripped[1:].split()[0]
+            continue
+        if stripped.endswith("genes found"):
+            continue
+
+        # Columns: row number, type-aminoacid, [start,end] (c[...] on the minus
+        # strand), anticodon position (tRNA) or coding region (tmRNA), and
+        # codon (tRNA) or peptide tag (tmRNA)
+        fields = re.sub(r"[ \t]+", " ", stripped).split(" ")
+        coords = re.match(r"c?\[(\d+),(\d+)\]", fields[2]) if len(fields) > 2 else None
+        if not coords:
+            continue  # not a gene row
+        start, end = int(coords.group(1)), int(coords.group(2))
+        strand = "-" if fields[2].startswith("c") else "+"
+        mol_type, _, aminoacid = fields[1].partition("-")
+        position = fields[3] if len(fields) > 3 else ""
+        codon_field = fields[4] if len(fields) > 4 else ""
+
+        # A tRNA intron is written after the codon as i(distance,length)
+        intron = re.search(r"i\((\d+),(\d+)\)", codon_field)
+        codon = re.sub(r"i\(\d+,\d+\)", "", codon_field).strip()
+
+        if mol_type == "tRNA":
+            name = f"trn{aminoacids.get(aminoacid, '')}{codon}"
+        elif mol_type == "tmRNA":
+            name = "ssrA"
         else:
-            gene_base = row['type']
+            name = mol_type
 
-        gene_id = gene_base
-        tmRNA_id = f"{gene_id}_tmRNA"
+        gene = Gene(seqid, "ARAGORN", name, [(start, end)], strand, {"gene": name})
+        genes.append(gene)
 
-        gff_rows.append({
-            "seqid": row['seqid'],
-            "source": "ARAGORN",
-            "type": "gene",
-            "start": row['start'],
-            "end": row['end'],
-            "score": ".",
-            "strand": row['strand'],
-            "phase": ".",
-            "attributes": f"ID={gene_id};name={gene_base};gene={gene_base}"
-        })
+        if mol_type == "tRNA":
+            attrs = {"product": f"tRNA-{aminoacid}"}
 
-        # tRNA Logic (handling introns)
-        if row['type'] == "tRNA":
-            position = f"complement({row['feature_start']}..{row['feature_end']})" if row['strand'] == "-" else f"{row['feature_start']}..{row['feature_end']}"
-            anticodon_attr = f"anticodon=(pos:{position},aa:{row['aminoacid']},seq:{str(row['codon']).replace('(', '').replace(')', '')})"
-            
-            if pd.notna(row['intron_start']):
-                # Split tRNA with intron
-                anticodon_attr = "" # Simplified for split features
-                if row['strand'] == '-':
-                    anticodon_attr = ""
-
-                # Part 1 (Exon 1)
-                gff_rows.append({
-                    "seqid": row['seqid'],
-                    "source": "ARAGORN",
-                    "type": "tRNA",
-                    "start": row['start'],
-                    "end": row['intron_start'] - 1,
-                    "score": ".",
-                    "strand": row['strand'],
-                    "phase": ".",
-                    "attributes": ";".join([x for x in [
-                        f"ID={gene_id}_tRNA",
-                        f"name={gene_id} tRNA",
-                        f"parent={gene_id}",
-                        f"product=tRNA-{row['aminoacid']}",
-                        anticodon_attr
-                    ] if x])
-                })
-                gff_rows.append({
-                    "seqid": row['seqid'],
-                    "source": "ARAGORN",
-                    "type": "exon",
-                    "start": row['start'],
-                    "end": row['intron_start'] - 1,
-                    "score": ".",
-                    "strand": row['strand'],
-                    "phase": ".",
-                    "attributes": f"ID={gene_id}_exon1;name={gene_id} exon1;parent={gene_id}_tRNA"
-                })
-                # Intron
-                gff_rows.append({
-                    "seqid": row['seqid'],
-                    "source": "ARAGORN",
-                    "type": "intron",
-                    "start": row['intron_start'],
-                    "end": row['intron_end'],
-                    "score": ".",
-                    "strand": row['strand'],
-                    "phase": ".",
-                    "attributes": f"ID={gene_id}_intron;name={gene_id} intron;parent={gene_id}"
-                })
-                # Part 2 (Exon 2)
-                gff_rows.append({
-                    "seqid": row['seqid'],
-                    "source": "ARAGORN",
-                    "type": "tRNA",
-                    "start": row['intron_end'] + 1,
-                    "end": row['end'],
-                    "score": ".",
-                    "strand": row['strand'],
-                    "phase": ".",
-                    "attributes": ";".join([x for x in [
-                        f"ID={gene_id}_tRNA",
-                        f"name={gene_id} tRNA",
-                        f"parent={gene_id}",
-                        f"product=tRNA-{row['aminoacid']}",
-                        anticodon_attr
-                    ] if x])
-                })
-                gff_rows.append({
-                    "seqid": row['seqid'],
-                    "source": "ARAGORN",
-                    "type": "exon",
-                    "start": row['intron_end'] + 1,
-                    "end": row['end'],
-                    "score": ".",
-                    "strand": row['strand'],
-                    "phase": ".",
-                    "attributes": f"ID={gene_id}_exon2;name={gene_id} exon2;parent={gene_id}_tRNA"
-                })
+            if intron:
+                # tRNA split by an intron: one tRNA feature with two parts,
+                # one exon per part, and the intron directly under the gene.
+                # (No anticodon attribute for split tRNAs.)
+                distance, length = int(intron.group(1)), int(intron.group(2))
+                if strand == "+":
+                    intron_start = start + distance - 1
+                    intron_end = start + distance + length - 2
+                else:
+                    intron_end = end - distance + 1
+                    intron_start = end - distance - length + 2
+                exons = [(start, intron_start - 1), (intron_end + 1, end)]
+                if strand == "-":
+                    exons.reverse()  # parts are listed 5' to 3'
+                trna = Feature("tRNA", exons, strand, attrs,
+                               children=[Feature("exon", [part], strand) for part in exons])
+                gene.children = [trna, Feature("intron", [(intron_start, intron_end)], strand)]
             else:
-                # Standard tRNA
-                gff_rows.append({
-                    "seqid": row['seqid'],
-                    "source": "ARAGORN",
-                    "type": "tRNA",
-                    "start": row['start'],
-                    "end": row['end'],
-                    "score": ".",
-                    "strand": row['strand'],
-                    "phase": ".",
-                    "attributes": ";".join([
-                        f"ID={gene_id}_tRNA",
-                        f"name={gene_id} tRNA",
-                        f"parent={gene_id}",
-                        f"product=tRNA-{row['aminoacid']}",
-                        anticodon_attr
-                    ])
-                })
+                # Anticodon: position is counted from the tRNA's 5' end
+                pos = int(position)
+                if strand == "+":
+                    ac_start, ac_end = start + pos - 1, start + pos + 1
+                else:
+                    ac_start, ac_end = end - pos - 1, end - pos + 1
+                location = f"complement({ac_start}..{ac_end})" if strand == "-" else f"{ac_start}..{ac_end}"
+                attrs["anticodon"] = f"(pos:{location},aa:{aminoacid},seq:{codon.replace('(', '').replace(')', '')})"
+                gene.children = [Feature("tRNA", [(start, end)], strand, attrs)]
 
-        # tmRNA Logic
-        elif row['type'] == "tmRNA":
-            gff_rows.append({
-                "seqid": row['seqid'],
-                "source": "ARAGORN",
-                "type": "tmRNA",
-                "start": row['start'],
-                "end": row['end'],
-                "score": ".",
-                "strand": row['strand'],
-                "phase": ".",
-                "attributes": f"ID={tmRNA_id};name=ssrA tmRNA;parent={gene_id}"
-            })
-            if organelle.lower() == "chloroplast":
-                transl_table = 11
-            elif organelle.lower() in ["mitochondrion", "mitochondria"]:
-                transl_table = 4
+        elif mol_type == "tmRNA":
+            # Coding region, given relative to the tmRNA's 5' end
+            rel_start, rel_end = map(int, position.split(","))
+            if strand == "+":
+                cds_start, cds_end = start + rel_start - 1, start + rel_end - 1
             else:
-                transl_table = None
-            
-            gff_rows.append({
-                "seqid": row['seqid'],
-                "source": "ARAGORN",
-                "type": "CDS",
-                "start": row['feature_start'],
-                "end": row['feature_end'],
-                "score": ".",
-                "strand": row['strand'],
-                "phase": "0",
-                "attributes": f"ID={tmRNA_id}_CDS;name={tmRNA_id} CDS;parent={tmRNA_id};transl_table={transl_table}"
-            })
+                cds_start, cds_end = end - rel_end + 1, end - rel_start + 1
+            cds_attrs = {"transl_table": genetic_code} if genetic_code else {}
+            cds = Feature("CDS", [(cds_start, cds_end)], strand, cds_attrs)
+            gene.children = [Feature("tmRNA", [(start, end)], strand, children=[cds])]
 
-    gff_df = pd.DataFrame(gff_rows, columns=["seqid", "source", "type", "start", "end", "score", "strand", "phase", "attributes"])
+    return genes
 
-    gff_df['start'] = gff_df['start'].astype(int)
-    gff_df['end'] = gff_df['end'].astype(int)
 
-    if export:
-        file_name = f"{directory}{seq_name}_AR.gff3"
-        with open(file_name, "w") as f:
-            f.write("##gff-version 3\n")
-        gff_df.to_csv(file_name, sep="\t", header=False, index=False, mode="a")
+# ============================================================
+# Merging
+# ============================================================
 
-    return gff_df
-
-def sort_gff3(gff3_object, contig_ids=None):
+def merge_annotations(mfannot_genes, aragorn_genes):
     """
-    Sorts a GFF3 DataFrame based on a custom biological order and coordinates.
+    Combines MFannot and Aragorn genes. Aragorn tRNA predictions replace
+    MFannot's, so MFannot tRNA genes are dropped.
+    """
+    kept = [gene for gene in mfannot_genes if not gene.name.startswith("trn")]
+    return kept + aragorn_genes
 
-    Parameters:
-    -----------
-    gff3_object : pd.DataFrame
-        The GFF3 data.
-    contig_ids : list of str, optional
-        Order of sequence IDs to respect when sorting.
+
+# ============================================================
+# GFF3 output
+# ============================================================
+
+def write_gff3(genes, path, contig_ids=None):
+    """
+    Writes genes to a GFF3 file, sorted by contig (in contig_ids order),
+    then position, then feature type.
+
+    Every gene gets a unique ID based on its name. Every feature gets an ID
+    made of its gene's ID and its type, numbered when a gene has several of
+    one type (cox1_intron1, cox1_intron2...). A feature with several parts
+    is written as one row per part, all sharing the same ID.
+    """
+
+    def escape(value):
+        """Percent-encodes the characters that have a meaning in GFF3 column 9."""
+        value = str(value)
+        for char, code in [("%", "%25"), (";", "%3B"), ("=", "%3D"), ("&", "%26"), (",", "%2C")]:
+            value = value.replace(char, code)
+        return value
+
+    rows = []
+
+    def add_rows(gene, feat_type, parts, strand, attrs, score=None):
+        """Adds one row per part of a gene or feature."""
+        # CDS phase depends on how much coding sequence came before (5' to 3')
+        if feat_type == "CDS":
+            phases, coding_length = [], 0
+            for s, e in parts:
+                phases.append((3 - coding_length % 3) % 3)
+                coding_length += e - s + 1
+        else:
+            phases = ["."] * len(parts)
+        column9 = ";".join(f"{key}={escape(val)}" for key, val in attrs.items())
+        for (s, e), phase in zip(parts, phases):
+            rows.append([gene.seqid, gene.source, feat_type, s, e,
+                         "." if score is None else f"{score:g}", strand, phase, column9])
+
+    # 1. Unique gene IDs. The contig is prepended when a name occurs on more
+    #    than one contig, and _1, _2... is appended when it occurs more than
+    #    once on the same contig.
+    by_name = defaultdict(lambda: defaultdict(list))
+    for gene in genes:
+        by_name[gene.name][gene.seqid].append(gene)
+
+    gene_ids = {}
+    for name, per_contig in by_name.items():
+        for seqid, copies in per_contig.items():
+            copies.sort(key=lambda g: min(s for s, _ in g.parts))
+            for n, gene in enumerate(copies, start=1):
+                prefix = f"{seqid}_" if len(per_contig) > 1 else ""
+                suffix = f"_{n}" if len(copies) > 1 else ""
+                gene_ids[gene] = f"{prefix}{name}{suffix}"
+
+    # 2. Rows of each gene and of the features inside it
+    for gene in genes:
+        gene_id = gene_ids[gene]
+        add_rows(gene, "gene", gene.parts, gene.strand,
+                 {"ID": gene_id, "Name": gene.name, **gene.attrs})
+
+        type_counts = Counter(feat.type for feat in get_gene_features(gene))
+        seen = Counter()
+
+        # Go down the tree, parents before children, remembering each
+        # feature's parent ID
+        pending = [(feat, gene_id) for feat in gene.children]
+        while pending:
+            feat, parent_id = pending.pop(0)
+            seen[feat.type] += 1
+            number = seen[feat.type] if type_counts[feat.type] > 1 else ""
+            feat_id = f"{gene_id}_{feat.type}{number}"
+            attrs = {"ID": feat_id, "Name": f"{gene.name} {feat.type}{number}",
+                     "Parent": parent_id, **feat.attrs}
+            add_rows(gene, feat.type, feat.parts, feat.strand, attrs, feat.score)
+            pending = [(child, feat_id) for child in feat.children] + pending
+
+    # 3. Sort by contig, position and type
+    contig_order = list(contig_ids or [])
+    for gene in genes:
+        if gene.seqid not in contig_order:
+            contig_order.append(gene.seqid)
+    rows.sort(key=lambda r: (contig_order.index(r[0]), r[3], TYPE_ORDER.get(r[2], len(TYPE_ORDER))))
+
+    # 4. Write
+    with open(path, "w") as f:
+        f.write("##gff-version 3\n")
+        for row in rows:
+            f.write("\t".join(str(x) for x in row) + "\n")
+
+
+# ============================================================
+# GenBank output
+# ============================================================
+
+def genbank_features(genes):
+    """
+    Converts genes into Biopython SeqFeatures, grouped by contig and sorted
+    by position. Every feature inherits its gene's /name and /gene qualifiers.
 
     Returns:
     --------
-    pd.DataFrame
-        Sorted DataFrame.
+    dict
+        seqid -> list of SeqFeature.
     """
-    custom_order = ["gene", "ncRNA", "rRNA", "tmRNA", "CDS", "tRNA", "intron", "exon"]
-    category_type = pd.CategoricalDtype(categories=custom_order, ordered=True)
-    gff3_object = gff3_object.copy()
-    gff3_object['type'] = gff3_object['type'].astype(category_type)
-    # Keep contigs grouped, in their order of first appearance (FASTA order)
-    if contig_ids is not None:
-        seqid_order = [c for c in contig_ids if c in gff3_object['seqid'].values]
-        for s in dict.fromkeys(gff3_object['seqid']):
-            if s not in seqid_order:
-                seqid_order.append(s)
-    else:
-        seqid_order = list(dict.fromkeys(gff3_object['seqid']))
 
-    gff3_object['seqid'] = pd.Categorical(gff3_object['seqid'],
-                                          categories=seqid_order, ordered=True)
-    gff3_object_sorted = gff3_object.sort_values(
-        by = ['seqid','start','type'],
-        ascending=[True,True,True]
-    )
-    return gff3_object_sorted
+    def make_seqfeature(feat_type, parts, strand, attrs):
+        """Builds one SeqFeature; several parts become a join()."""
+        sign = 1 if strand == "+" else -1
+        locations = [FeatureLocation(s - 1, e, strand=sign) for s, e in parts]
+        location = locations[0] if len(locations) == 1 else CompoundLocation(locations)
+        qualifiers = {key: [str(val)] for key, val in attrs.items()}
+        return SeqFeature(location, type=feat_type, qualifiers=qualifiers)
 
-def merge_annotations(mfannot_gff3, aragorn_gff3, seq_name="Default_name", export=True, directory: str = "", contig_ids=None):
-    """
-    Merges MFannot and Aragorn GFF3 DataFrames.
-    Aragorn tRNA predictions supersede MFannot tRNA predictions.
+    per_contig = defaultdict(list)
+    for gene in genes:
+        # Every feature carries its gene's name, so ORFs (which get no /gene)
+        # are still labelled. /name is not an INSDC qualifier: an NCBI
+        # submission output will need /locus_tag or similar instead.
+        gene_qualifiers = {"name": gene.name}
+        if "gene" in gene.attrs:
+            gene_qualifiers["gene"] = gene.attrs["gene"]
+        per_contig[gene.seqid].append(
+            make_seqfeature("gene", gene.parts, gene.strand, {**gene_qualifiers, **gene.attrs}))
+        for feat in get_gene_features(gene):
+            per_contig[gene.seqid].append(
+                make_seqfeature(feat.type, feat.parts, feat.strand, {**gene_qualifiers, **feat.attrs}))
 
-    Parameters:
-    -----------
-    mfannot_gff3 : pd.DataFrame
-        MFannot GFF3 data.
-    aragorn_gff3 : pd.DataFrame
-        Aragorn GFF3 data.
-    seq_name : str
-        Sequence identifier.
-    export : bool
-        If True, writes the merged result to a file.
-    directory : str or Path
-        Output directory.
-    contig_ids : list of str, optional
-        Preserved contig order for sorting.
+    for features in per_contig.values():
+        features.sort(key=lambda sf: (int(sf.location.start), TYPE_ORDER.get(sf.type, len(TYPE_ORDER))))
+    return per_contig
 
-    Returns:
-    --------
-    pd.DataFrame
-        Merged and sorted GFF3 DataFrame.
-    """
-    # Remove tRNAs from the MFannot object (Aragorn is preferred for tRNAs)
-    # 1. Filter MFannot tRNAs safely
-    if not mfannot_gff3.empty:
-        filtered_mf = mfannot_gff3.loc[~mfannot_gff3['attributes'].str.contains(r"(?:ID|parent)=trn", na=False)]
-    else:
-        filtered_mf = mfannot_gff3
 
-    # 2. Avoid a pandas FutureWarning by choosing the non-empty frame
-    if filtered_mf.empty and aragorn_gff3.empty:
-        merged_df = filtered_mf.copy() # Keeps the column structure
-    elif filtered_mf.empty:
-        merged_df = aragorn_gff3.copy().reset_index(drop=True)
-    elif aragorn_gff3.empty:
-        merged_df = filtered_mf.copy().reset_index(drop=True)
-    else:
-        merged_df = pd.concat([filtered_mf, aragorn_gff3], ignore_index=True)
-
-    # 3. Disambiguate duplicate IDs across sequences and within sequences
-    if not merged_df.empty:
-        gene_indices = merged_df.index[merged_df['type'] == 'gene'].tolist()
-        gene_occurrences = defaultdict(lambda: defaultdict(list))
-
-        # Pass 1: Map where each gene appears across all sequences
-        for idx in gene_indices:
-            attr = merged_df.at[idx, 'attributes']
-            match = re.search(r"(?:^|;)ID=([^;]+)", attr)
-            base_id = match.group(1) if match else "unknown_gene"
-            seqid = merged_df.at[idx, 'seqid']
-            gene_occurrences[base_id][seqid].append(idx)
-
-        # Pass 2: Compute disambiguated IDs and cascade strictly to ID and parent
-        for base_id, seq_dict in gene_occurrences.items():
-            multi_seq = len(seq_dict) > 1
-
-            for seqid, idx_list in seq_dict.items():
-                multi_in_seq = len(idx_list) > 1
-
-                for copy_num, g_idx in enumerate(idx_list, start=1):
-                    # Add {seqid}_ prefix if present in multiple sequences; add _1, _2 suffix if multiple on this sequence
-                    prefix = f"{seqid}_" if multi_seq else ""
-                    suffix = f"_{copy_num}" if multi_in_seq else ""
-                    new_gene_id = f"{prefix}{base_id}{suffix}"
-
-                    if new_gene_id == base_id:
-                        continue  # Globally unique, leave unmodified
-
-                    g_start = merged_df.at[g_idx, 'start']
-                    g_end = merged_df.at[g_idx, 'end']
-
-                    # Target only ID= and parent=/Parent= fields, leaving name= and gene= untouched
-                    pattern = re.compile(rf"((?:^|;)(?:ID|parent|Parent)=){re.escape(base_id)}(?=[;_]|$)")
-
-                    # Update the parent gene row ID
-                    old_attr = merged_df.at[g_idx, 'attributes']
-                    merged_df.at[g_idx, 'attributes'] = pattern.sub(rf"\g<1>{new_gene_id}", old_attr)
-
-                    # Update child feature ID and parent references within the gene span
-                    candidate_mask = (
-                        (merged_df['seqid'] == seqid) &
-                        (merged_df['start'] >= g_start) &
-                        (merged_df['end'] <= g_end) &
-                        (merged_df.index != g_idx) &
-                        (merged_df['attributes'].str.contains(rf"(?:ID|parent|Parent)={re.escape(base_id)}", regex=True, na=False))
-                    )
-
-                    for child_idx in merged_df.index[candidate_mask]:
-                        c_attr = merged_df.at[child_idx, 'attributes']
-                        merged_df.at[child_idx, 'attributes'] = pattern.sub(rf"\g<1>{new_gene_id}", c_attr)
-
-    # 4. Only process and sort if there's data. Each feature keeps its own
-    #    seqid, so multi-contig genomes stay separated by contig.
-    if not merged_df.empty:
-        sorted_df = sort_gff3(merged_df, contig_ids=contig_ids)
-    else:
-        sorted_df = merged_df
-
-    # 5. Standard GFF3 export
-    if export:
-        file_name = Path(directory) / f"{seq_name}.gff3"
-        with open(file_name, "w") as f:
-            f.write("##gff-version 3\n")
-        # Only append data if sorted_df is not empty
-        if not sorted_df.empty:
-            sorted_df.to_csv(file_name, sep="\t", header=False, index=False, mode="a")
-
-    return sorted_df
+# ============================================================
+# Main pipeline
+# ============================================================
 
 def annotate_sequence(
     seq_file,
@@ -876,6 +709,10 @@ def annotate_sequence(
     """
     Main pipeline: Annotates a FASTA or GenBank sequence file using MFannot and Aragorn.
     Handles sequence rotation if circular sequences are present.
+
+    organelle is an organelle name ('chloroplast', 'plastid', 'mitochondrion',
+    'mitochondria') or a genetic code number (e.g. 4 or "4").
+    format is 'gb' or 'gff3'.
     """
     start_time = time.time()
 
@@ -897,7 +734,23 @@ def annotate_sequence(
             f"Unsupported file format '{input_suffix}' for {seq_file}. "
             f"Supported formats are FASTA ({', '.join(valid_fasta)}) and GenBank ({', '.join(valid_gb)})."
         )
+    if format not in ("gb", "gff3"):
+        raise ValueError(f"Unsupported output format '{format}'. Use 'gb' or 'gff3'.")
     is_gb_input = input_suffix in valid_gb
+
+    # Genetic code: a number is used as given, organelle names are translated
+    organelle_value = str(organelle).strip().lower()
+    if organelle_value.isdigit():
+        genetic_code = int(organelle_value)
+    elif organelle_value in ("chloroplast", "plastid"):
+        genetic_code = 11
+    elif organelle_value in ("mitochondrion", "mitochondria"):
+        genetic_code = 4
+    else:
+        raise ValueError(
+            f"Unknown organelle '{organelle}' for {seq_file}. Use 'chloroplast', 'plastid', "
+            f"'mitochondrion', 'mitochondria' or a genetic code number."
+        )
 
     seq_stem = input_file_path.stem.replace(" ", "_")
     log_path = out_dir / f"{seq_stem}.log"
@@ -916,15 +769,17 @@ def annotate_sequence(
     if not return_log:
         log(
             f"SOGA annotation of {seq_file}\n"
-            f"  started:    {time.strftime('%Y-%m-%d %H:%M:%S')}\n"
-            f"  organelle:  {organelle}\n"
-            f"  format:     {format}\n"
-            f"  circular:   {circular}\n"
-            f"  keep_old:   {keep_old}\n"
-            f"  output_dir: {out_dir}"
+            f"  started:      {time.strftime('%Y-%m-%d %H:%M:%S')}\n"
+            f"  organelle:    {organelle}\n"
+            f"  genetic code: {genetic_code}\n"
+            f"  format:       {format}\n"
+            f"  circular:     {circular}\n"
+            f"  keep_old:     {keep_old}\n"
+            f"  output_dir:   {out_dir}"
         )
     else:
-        log(f"Started: {time.strftime('%H:%M:%S')} | Organelle: {organelle} | Circular: {circular}")
+        log(f"Started: {time.strftime('%H:%M:%S')} | Organelle: {organelle} "
+            f"| Genetic code: {genetic_code} | Circular: {circular}")
 
     try:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -1009,7 +864,7 @@ def annotate_sequence(
             # 5. FEATURE ANNOTATION (MFannot & Aragorn)
             # ---------------------------------------------------------
             try:
-                mfannot_out = annotate_mfannot(str(working_fasta), tmp_path, organelle)
+                mfannot_out = annotate_mfannot(str(working_fasta), tmp_path, genetic_code)
                 log(mfannot_out, "MFannot")
             except RuntimeError as e:
                 log(str(e), "MFannot")
@@ -1024,29 +879,25 @@ def annotate_sequence(
 
                 circ_fasta = tmp_path / f"{seq_stem}_circ.fasta"
                 SeqIO.write(circ_records, str(circ_fasta), "fasta")
-                log(annotate_aragorn(str(circ_fasta), tmp_path, organelle, circular=True), "Aragorn (circular)")
-                ar_circ_df = aragorn_to_gff3(f"{seq_stem}_circ.txt", seq_stem, False, tmp_path, organelle)
+                log(annotate_aragorn(str(circ_fasta), tmp_path, genetic_code, circular=True), "Aragorn (circular)")
+                ar_genes = parse_aragorn(tmp_path / f"{seq_stem}_circ.txt", genetic_code, seq_stem)
 
                 lin_fasta = tmp_path / f"{seq_stem}_lin.fasta"
                 SeqIO.write(lin_records, str(lin_fasta), "fasta")
-                log(annotate_aragorn(str(lin_fasta), tmp_path, organelle, circular=False), "Aragorn (linear)")
-                ar_lin_df = aragorn_to_gff3(f"{seq_stem}_lin.txt", seq_stem, False, tmp_path, organelle)
-
-                ar_df = pd.concat([ar_circ_df, ar_lin_df], ignore_index=True)
-                ar_df = sort_gff3(ar_df, contig_ids=contig_ids)
+                log(annotate_aragorn(str(lin_fasta), tmp_path, genetic_code, circular=False), "Aragorn (linear)")
+                ar_genes += parse_aragorn(tmp_path / f"{seq_stem}_lin.txt", genetic_code, seq_stem)
             else:
-                log(annotate_aragorn(str(working_fasta), tmp_path, organelle, circular=has_circular), "Aragorn")
-                ar_df = aragorn_to_gff3(f"{seq_stem}.txt", seq_stem, False, tmp_path, organelle)
+                log(annotate_aragorn(str(working_fasta), tmp_path, genetic_code, circular=has_circular), "Aragorn")
+                ar_genes = parse_aragorn(tmp_path / f"{seq_stem}.txt", genetic_code, seq_stem)
 
             tbl_file = tmp_path / f"{seq_stem}.tbl"
-            mf_df = mfannot_to_gff3(str(tbl_file), seq_stem, False, tmp_path, organelle, contig_ids=contig_ids)
+            mf_genes = parse_mfannot(tbl_file, genetic_code, contig_ids, seq_stem)
 
-            if mf_df.empty and ar_df.empty:
+            if not mf_genes and not ar_genes:
                 log(f"File {seq_stem} has no features")
                 return "\n".join(log_lines) if return_log else None
 
-            merge_annotations(mf_df, ar_df, seq_stem, True, tmp_path, contig_ids=contig_ids)
-            export_gff3 = tmp_path / f"{seq_stem}.gff3"
+            genes = merge_annotations(mf_genes, ar_genes)
 
             # ---------------------------------------------------------
             # 6. BACKUP & EXPORT
@@ -1071,26 +922,17 @@ def annotate_sequence(
                     for rec in SeqIO.parse(str(working_fasta), "fasta"):
                         rec.name = rec.id[:16]
                         rec.annotations["molecule_type"] = "DNA"
-                        rec.annotations["topology"] = "circular" if is_circular.get(rec_id, False) else "linear"
+                        rec.annotations["topology"] = "circular" if is_circular.get(rec.id, False) else "linear"
                         records[rec.id] = rec
 
-                with open(export_gff3) as gff_handle:
-                    annotated = list(GFF.parse(gff_handle, base_dict=records))
-
-                for rec in annotated:
-                    flat = []
-                    stack = list(rec.features)
-                    while stack:
-                        f = stack.pop(0)
-                        flat.append(f)
-                        if hasattr(f, "sub_features") and f.sub_features:
-                            stack = list(f.sub_features) + stack
-                    records[rec.id].features = flat
+                features = genbank_features(genes)
+                for rec_id, rec in records.items():
+                    rec.features = features.get(rec_id, [])
 
                 SeqIO.write([records[i] for i in contig_ids if i in records], str(out_dir / f"{seq_stem}.gb"), "gb")
 
             elif format == "gff3":
-                shutil.copy(export_gff3, out_dir / f"{seq_stem}.gff3")
+                write_gff3(genes, out_dir / f"{seq_stem}.gff3", contig_ids)
 
             # ---------------------------------------------------------
             # 7. CLEANUP & FINISH

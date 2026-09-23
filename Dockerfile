@@ -75,7 +75,7 @@ RUN wget -q https://anaconda.org/bioconda/tbl2asn/25.7/download/linux-64/tbl2asn
     && ln -s /usr/lib/x86_64-linux-gnu/libidn.so.12 /usr/lib/x86_64-linux-gnu/libidn.so.11
 
 # Erpin
-RUN wget -q http://rna.igmors.u-psud.fr/download/Erpin/erpin5.5.4.serv.tar.gz \
+   RUN wget -q http://rssf.i2bc.paris-saclay.fr/download/Erpin/erpin5.5.4.serv.tar.gz \
     && tar -xzf erpin5.5.4.serv.tar.gz \
     && cp erpin5.5.4.serv/bin/erpin /usr/local/bin/ \
     && chmod +x /usr/local/bin/erpin \

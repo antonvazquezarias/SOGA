@@ -10,6 +10,18 @@ from pipeline import annotate_sequence
 VALID_FASTA = {".fasta", ".fa", ".fna"}
 VALID_GB = {".gb", ".gbk", ".genbank"}
 VALID_EXTENSIONS = VALID_FASTA | VALID_GB
+ORGANELLE_NAMES = {"chloroplast", "plastid", "mitochondrion", "mitochondria"}
+
+
+def organelle_arg(value):
+    """Checks --organelle: an organelle name or a genetic code number."""
+    cleaned = value.strip().lower()
+    if cleaned in ORGANELLE_NAMES or cleaned.isdigit():
+        return cleaned
+    raise argparse.ArgumentTypeError(
+        f"'{value}' is not an organelle name ({', '.join(sorted(ORGANELLE_NAMES))}) "
+        f"or a genetic code number"
+    )
 
 
 def main():
@@ -34,8 +46,12 @@ def main():
     shared_group = parser.add_argument_group("shared options")
     shared_group.add_argument(
         "--organelle",
-        choices=["chloroplast", "mitochondrion"],
-        help="Organelle type (required for single files; in batch mode, applies to all files if no suffix is given)",
+        type=organelle_arg,
+        help=(
+            "Organelle type or NCBI genetic code number: chloroplast/plastid use code 11, "
+            "mitochondrion/mitochondria code 4, or give the code directly (e.g. 1). "
+            "Required for single files; in batch mode, applies to all files if no suffix is given"
+        ),
     )
     shared_group.add_argument(
         "--format",
