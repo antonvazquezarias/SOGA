@@ -168,4 +168,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 COPY src/ /opt/pipeline/src/
 WORKDIR /opt/pipeline/src
 
+# Custom rnl/rns HMMs, joined into one file per organelle for a single nhmmer run
+COPY SOGA_data/hmms/ /SOGA_data/hmms/
+
 ENTRYPOINT ["python3", "run.py"]

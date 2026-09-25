@@ -13,21 +13,6 @@ from Bio.Seq import Seq
 from Bio.SeqFeature import SeqFeature, FeatureLocation, CompoundLocation
 
 # Functions
-def fasta_contig_ids(fasta_file, directory: str = ""):
-    """
-    Returns the sequence IDs of a FASTA file, in order of appearance.
-
-    The ID is the first whitespace-delimited token of each header line, which
-    is how Aragorn refers to each contig. MFannot instead renames them C_0,
-    C_1, ... in the same order, so this list maps one onto the other.
-    """
-    ids = []
-    with open(Path(directory) / fasta_file) as f:
-        for line in f:
-            if line.startswith(">"):
-                ids.append(line[1:].split()[0])
-    return ids
-
 def reorder_sequence(seq, strand, cut_pos):
     """
     Reorders a circular sequence starting from a specific cut position
@@ -54,75 +39,76 @@ def reorder_sequence(seq, strand, cut_pos):
         seq = seq.translate(complement)[::-1]
     return seq
 
-# HMM models shipped inside the MFannot image, used to locate rns cheaply
-RNS_MODELS = [
-    "/MFannot_data/models/HMM_models/RNA/5-rns-other.hmm",
-    "/MFannot_data/models/HMM_models/RNA/5-rns-fungi.hmm",
-]
 
-def find_rns_start(fasta_file, directory: str = "", evalue="1e-3"):
+def find_rns_start(genes, seqid):
     """
-    Locates the 5' end of rns with nhmmer, without running a full annotation.
+    Finds the 5' end of rns on a contig, from the genes found by nhmmer.
 
-    Unlike MFannot, this also finds an rns that spans the origin of the linear
-    representation: MFannot discards a feature whose parts are not in
-    increasing coordinate order, whereas nhmmer scores each match on its own.
+    A fragmented rns starts at its first module (rns_a). If rns is present
+    more than once (e.g. in an inverted repeat), the highest-scoring copy
+    is used.
 
     Parameters:
     -----------
-    fasta_file : str
-        Single-sequence FASTA file to search.
-    directory : str or Path
-        Directory containing the file.
-    evalue : str
-        Reporting threshold passed to nhmmer.
+    genes : list of Gene
+        Output of parse_hmmer.
+    seqid : str
+        Contig to search.
 
     Returns:
     --------
     tuple or None
         (strand, position) where position is the 1-based coordinate of the
-        first base of rns on that strand, or None if no match was found.
+        first base of rns on that strand, or None if the contig has no rns.
     """
-    path = Path(directory) / fasta_file
-
-    length = 0
-    with open(path) as f:
-        for line in f:
-            if not line.startswith(">"):
-                length += len(line.strip())
-
-    best = None
-    for model in RNS_MODELS:
-        if not Path(model).exists():
-            continue
-        proc = subprocess.run(
-            ["nhmmer", "--dna", "--tblout", "/dev/stdout", "-o", "/dev/null",
-             "-E", evalue, model, str(path)],
-            stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-            universal_newlines=True)
-        if proc.returncode != 0:
-            continue
-        for line in (proc.stdout or "").splitlines():
-            if line.startswith("#") or not line.strip():
-                continue
-            fields = line.split()
-            if len(fields) < 13:
-                continue
-            hmmfrom, alifrom, strand = int(fields[4]), int(fields[6]), fields[11]
-            score = float(fields[12])
-            if best is None or score < best[0]:
-                best = (score, hmmfrom, alifrom, strand)
-
-    if best is None:
+    candidates = [g for g in genes if g.seqid == seqid and g.name in ("rns", "rns_a")]
+    if not candidates:
         return None
+    rns = max(candidates, key=lambda g: g.children[0].score)
+    start, end = rns.parts[0]
+    return rns.strand, start if rns.strand == "+" else end
 
-    _, hmmfrom, alifrom, strand = best
-    # The match may start inside the model, so walk back to model position 1.
-    offset = hmmfrom - 1
-    start = alifrom - offset if strand == "+" else alifrom + offset
-    # Walking back can run off either end of a circular sequence.
-    start = ((start - 1) % length) + 1
-    return strand, start
+
+def annotate_hmmer(fasta_file, directory, genetic_code):
+    """
+    Runs nhmmer with the custom rnl/rns models to locate the rRNA genes.
+
+    Writes <name>_nhmmer.tbl (hit table) and <name>_nhmmer.out (alignments,
+    one line each), both read by parse_hmmer.
+
+    Parameters:
+    -----------
+    fasta_file : str
+        Input FASTA file.
+    directory : str or Path
+        Directory containing the file.
+    genetic_code : int
+        NCBI translation table. 11 uses the plastid models, anything else
+        the mitochondrial ones.
+    """
+    folder = Path(directory).resolve()
+    file_name = Path(fasta_file).stem
+    organelle = "chloro" if genetic_code == 11 else "mito"
+
+    proc = subprocess.run([
+        "nhmmer",
+        "--tblout", f"{file_name}_nhmmer.tbl",
+        "-o", f"{file_name}_nhmmer.out",
+        "--notextw",    # one line per alignment
+        f"/SOGA_data/hmms/rrna_{organelle}.hmm",
+        f"{file_name}.fasta"
+    ], cwd=folder, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+
+    if proc.returncode != 0:
+        log = (proc.stdout or "").strip()
+        tail = "\n".join(log.splitlines()[-20:]) or "(nhmmer produced no output)"
+        raise RuntimeError(
+            f"nhmmer failed for {file_name} in {folder}\n"
+            f"  exit code: {proc.returncode}\n"
+            f"  last lines of nhmmer output:\n{tail}"
+        )
+    return proc.stdout or ""
+
 
 def annotate_mfannot(fasta_file, directory, genetic_code):
     """
@@ -212,7 +198,7 @@ def annotate_aragorn(fasta_file, directory, genetic_code, circular=True):
 # ============================================================
 # Annotation model
 # ============================================================
-# The parsers turn MFannot and Aragorn output into a list of Gene objects,
+# The parsers turn MFannot, Aragorn and nhmmer output into a list of Gene objects,
 # merging works on that list, and GFF3 or GenBank output is written from it
 # at the very end. A child is linked to its parent by being stored inside it,
 # not by an ID string, so two genes with the same name can never be confused.
@@ -424,9 +410,13 @@ def parse_mfannot(tbl_file, genetic_code=None, contig_ids=None, seq_name="Defaul
     return genes
 
 
-def parse_aragorn(txt_file, genetic_code=None, seq_name="Default_name"):
+def parse_aragorn(txt_file, genetic_code=None, seq_name="Default_name", contig_lengths=None):
     """
     Parses Aragorn batch (-w) output into a list of Gene objects.
+
+    On circular contigs, Aragorn writes a gene crossing the origin as
+    [start,end] with start > end. Such genes are built with coordinates
+    continuing past the contig end, then split at the origin.
 
     Parameters:
     -----------
@@ -437,6 +427,8 @@ def parse_aragorn(txt_file, genetic_code=None, seq_name="Default_name"):
     seq_name : str
         Fallback sequence identifier, used only if a data row precedes any
         contig header, which does not happen in normal Aragorn output.
+    contig_lengths : dict, optional
+        seqid -> length, needed to split genes that cross the origin.
 
     Returns:
     --------
@@ -454,7 +446,7 @@ def parse_aragorn(txt_file, genetic_code=None, seq_name="Default_name"):
         raw_lines = f.read().splitlines()
 
     # Batch (-w) output holds one section per contig:
-    #   >contig_id len=...
+    #   >contig_id description
     #   N genes found
     #   1  tRNA-Xxx  [a,b]  pos  (codon)
     # and closes with a ">end ..." line. Keep the contig id for every data row,
@@ -481,6 +473,12 @@ def parse_aragorn(txt_file, genetic_code=None, seq_name="Default_name"):
             continue  # not a gene row
         start, end = int(coords.group(1)), int(coords.group(2))
         strand = "-" if fields[2].startswith("c") else "+"
+
+        # Gene crossing the origin: continue the coordinates past the contig end
+        contig_length = (contig_lengths or {}).get(seqid)
+        crosses_origin = start > end and contig_length is not None
+        if crosses_origin:
+            end += contig_length
         mol_type, _, aminoacid = fields[1].partition("-")
         position = fields[3] if len(fields) > 3 else ""
         codon_field = fields[4] if len(fields) > 4 else ""
@@ -526,6 +524,8 @@ def parse_aragorn(txt_file, genetic_code=None, seq_name="Default_name"):
                     ac_start, ac_end = start + pos - 1, start + pos + 1
                 else:
                     ac_start, ac_end = end - pos - 1, end - pos + 1
+                if crosses_origin:
+                    ac_start, ac_end = (ac_start - 1) % contig_length + 1, (ac_end - 1) % contig_length + 1
                 location = f"complement({ac_start}..{ac_end})" if strand == "-" else f"{ac_start}..{ac_end}"
                 attrs["anticodon"] = f"(pos:{location},aa:{aminoacid},seq:{codon.replace('(', '').replace(')', '')})"
                 gene.children = [Feature("tRNA", [(start, end)], strand, attrs)]
@@ -541,25 +541,280 @@ def parse_aragorn(txt_file, genetic_code=None, seq_name="Default_name"):
             cds = Feature("CDS", [(cds_start, cds_end)], strand, cds_attrs)
             gene.children = [Feature("tmRNA", [(start, end)], strand, children=[cds])]
 
+        # Back to real coordinates, splitting whatever crosses the origin.
+        # Parts stay 5' to 3': on the minus strand, the piece at the origin comes first.
+        if crosses_origin:
+            for item in [gene] + get_gene_features(gene):
+                wrapped = []
+                for s, e in item.parts:
+                    if s > contig_length:
+                        wrapped.append((s - contig_length, e - contig_length))
+                    elif e > contig_length:
+                        pieces = [(s, contig_length), (1, e - contig_length)]
+                        wrapped += pieces if strand == "+" else pieces[::-1]
+                    else:
+                        wrapped.append((s, e))
+                item.parts = wrapped
+
     return genes
 
 
-# ============================================================
-# Merging
-# ============================================================
-
-def merge_annotations(mfannot_genes, aragorn_genes):
+def parse_hmmer(tbl_file, out_file, seed_evalue=1e-5, max_hole=50, max_overlap=150, max_gap=10_000):
     """
-    Combines MFannot and Aragorn genes. Aragorn tRNA predictions replace
-    MFannot's, so MFannot tRNA genes are dropped.
+    Parses nhmmer output of the rnl/rns HMMs into a list of Gene objects.
+
+    For each contig and gene, only the lineage model with the highest summed
+    score is used. Its hits are chained into segments (the exons of one
+    continuous stretch of the gene), and segments are grouped into gene copies:
+    segments sharing model positions are separate copies (e.g. inverted
+    repeats), segments that don't are modules of one fragmented gene, named
+    rnl_a, rnl_b... in model order.
+
+    Exon-intron junctions use alignment coordinates, which match curated
+    boundaries closely; the outer ends of each gene or module use envelope
+    coordinates, since alignments fade out at the variable rRNA termini.
+
+    Parameters:
+    -----------
+    tbl_file : str or Path
+        nhmmer --tblout file. May hold hits of several models and contigs.
+    out_file : str or Path
+        nhmmer main output (-o) of the same search, written with alignments
+        (no --noali) and --notextw. Used to place the cut when consecutive
+        exons overlap in the model.
+    seed_evalue : float
+        A segment must contain at least one hit with this E-value or lower.
+        Weaker hits can only extend a segment, never start one.
+    max_hole : int
+        Max model positions skipped between consecutive exons.
+    max_overlap : int
+        Max model positions shared by consecutive exons, and by modules of
+        the same fragmented gene.
+    max_gap : int
+        Max bases between consecutive exons.
+
+    Returns:
+    --------
+    list of Gene
     """
-    kept = [gene for gene in mfannot_genes if not gene.name.startswith("trn")]
-    return kept + aragorn_genes
+    products = {
+        "rnl": "large subunit ribosomal RNA",
+        "rns": "small subunit ribosomal RNA",
+    }
+
+    def distance(a, b):
+        """Bases between hit a and hit b, b being downstream of a on their strand."""
+        if a["strand"] == "+":
+            return b["start"] - a["end"] - 1
+        return a["start"] - b["end"] - 1
+
+    def follows(a, b):
+        """True if hit b can be the next exon after hit a."""
+        hole = b["hmm_from"] - a["hmm_to"] - 1  # negative = overlap in the model
+        return (a["strand"] == b["strand"]
+                and b["hmm_from"] > a["hmm_from"] and b["hmm_to"] > a["hmm_to"]
+                and -max_overlap <= hole <= max_hole
+                and 1 <= distance(a, b) <= max_gap)
+
+    # ------------------------------------------------------------
+    # 1. Read hits, grouped by contig and gene
+    # ------------------------------------------------------------
+    # Columns: target, accession, query, accession, hmmfrom, hmm to, alifrom,
+    # ali to, envfrom, env to, sq len, strand, E-value, score, bias, description.
+    # Minus-strand hits are written end..start.
+    groups = defaultdict(list)
+    with open(tbl_file) as f:
+        for line in f:
+            if line.startswith("#") or not line.strip():
+                continue
+            fields = line.split()
+            a, b, env_a, env_b = int(fields[6]), int(fields[7]), int(fields[8]), int(fields[9])
+            gene_type = "rnl" if "rnl" in fields[2] else "rns"
+            groups[(fields[0], gene_type)].append({
+                "key": (fields[0], fields[2], min(a, b), max(a, b)),  # to find its alignment
+                "model": fields[2],
+                "hmm_from": int(fields[4]), "hmm_to": int(fields[5]),
+                "start": min(a, b), "end": max(a, b),
+                "env_start": min(env_a, env_b), "env_end": max(env_a, env_b),
+                "strand": fields[11],
+                "evalue": float(fields[12]), "score": float(fields[13]),
+            })
+
+    # ------------------------------------------------------------
+    # 2. Read alignments, as one (model position, genome position, PP)
+    #    tuple per column. Insertions have no model position, deletions no
+    #    genome position. PP digits are 0-9 and "*" counts as 10.
+    # ------------------------------------------------------------
+    # Each alignment is four lines: model, match, target and PP:
+    #   Rhodophyta_rnl_mito  2220 actcat...ggtc..cctA... 2434
+    #                             actcat...ggtc   c A...
+    #           NC_026905.1 25958 ACTCAT...GGTCgtGCGA... 26153
+    #                             79****...***944589... PP
+    alignments = {}
+    with open(out_file) as f:
+        lines = f.read().splitlines()
+    query = None
+    for i, line in enumerate(lines):
+        fields = line.split()
+        if line.startswith("Query:"):
+            query = fields[1]
+        elif len(fields) == 4 and fields[0] == query and fields[1].isdigit():
+            model_line, target_line, pp_line = fields, lines[i + 2].split(), lines[i + 3].split()[0]
+            a, b = int(target_line[1]), int(target_line[3])
+            step = 1 if b >= a else -1
+            model_pos, genome_pos = int(model_line[1]), a
+            columns = []
+            for m, t, p in zip(model_line[2], target_line[2], pp_line):
+                pp = 10 if p == "*" else int(p) if p.isdigit() else 0
+                columns.append((model_pos if m != "." else None,
+                                genome_pos if t != "-" else None,
+                                pp))
+                if m != ".":
+                    model_pos += 1
+                if t != "-":
+                    genome_pos += step
+            alignments[(target_line[0], query, min(a, b), max(a, b))] = columns
+
+    genes = []
+    for (seqid, gene_type), hits in groups.items():
+
+        # ------------------------------------------------------------
+        # 3. Keep the lineage model with the highest summed score
+        # ------------------------------------------------------------
+        totals = defaultdict(float)
+        for h in hits:
+            if h["evalue"] <= seed_evalue:
+                totals[h["model"]] += h["score"]
+        if not totals:
+            continue
+        best_model = max(totals, key=totals.get)
+        hits = sorted((h for h in hits if h["model"] == best_model),
+                      key=lambda h: h["score"], reverse=True)
+
+        # ------------------------------------------------------------
+        # 4. Chain hits into segments, seeding from the strongest and
+        #    always taking the nearest compatible hit
+        # ------------------------------------------------------------
+        unused = list(hits)
+        segments = []
+        for seed in hits:
+            if seed not in unused or seed["evalue"] > seed_evalue:
+                continue
+            unused.remove(seed)
+            segment = [seed]
+
+            while True:  # towards 3'
+                options = [h for h in unused if follows(segment[-1], h)]
+                if not options:
+                    break
+                nxt = min(options, key=lambda h: distance(segment[-1], h))
+                segment.append(nxt)
+                unused.remove(nxt)
+
+            while True:  # towards 5'
+                options = [h for h in unused if follows(h, segment[0])]
+                if not options:
+                    break
+                prv = min(options, key=lambda h: distance(h, segment[0]))
+                segment.insert(0, prv)
+                unused.remove(prv)
+
+            segments.append(segment)
+
+        # ------------------------------------------------------------
+        # 5. Group segments: shared model positions = separate copies,
+        #    no shared positions = modules of one fragmented gene
+        # ------------------------------------------------------------
+        copies = []
+        for seg in sorted(segments, key=lambda s: sum(h["score"] for h in s), reverse=True):
+            for copy in copies:
+                overlaps = [min(seg[-1]["hmm_to"], other[-1]["hmm_to"])
+                            - max(seg[0]["hmm_from"], other[0]["hmm_from"]) + 1
+                            for other in copy]
+                if max(overlaps) <= max_overlap:
+                    copy.append(seg)
+                    break
+            else:
+                copies.append([seg])
+
+        for copy in copies:
+            copy.sort(key=lambda s: s[0]["hmm_from"])
+            for i, segment in enumerate(copy):
+                name = gene_type if len(copy) == 1 else f"{gene_type}_{chr(ord('a') + i)}"
+                strand = segment[0]["strand"]
+
+                # ------------------------------------------------------------
+                # 6. Resolve model overlaps between consecutive exons: prev
+                #    keeps the shared positions up to the cut, hit keeps the
+                #    rest. Take the cut with the highest summed PP of both
+                #    alignments over the shared positions.
+                # ------------------------------------------------------------
+                for prev, hit in zip(segment, segment[1:]):
+                    if prev["hmm_to"] < hit["hmm_from"]:
+                        continue
+
+                    prev_columns, hit_columns = alignments[prev["key"]], alignments[hit["key"]]
+                    prev_pp = {m: p for m, g, p in prev_columns if m is not None}
+                    hit_pp = {m: p for m, g, p in hit_columns if m is not None}
+                    shared = range(hit["hmm_from"], prev["hmm_to"] + 1)
+                    cut = max(range(shared.start - 1, shared.stop),
+                              key=lambda c: sum(prev_pp[m] for m in shared if m <= c)
+                                          + sum(hit_pp[m] for m in shared if m > c))
+
+                    # Last genome base of prev at or before the cut, first of hit after it
+                    prev_3 = [g for m, g, p in prev_columns if m is not None and m <= cut and g is not None][-1]
+                    hit_5 = [g for m, g, p in hit_columns if m is not None and m > cut and g is not None][0]
+                    prev["hmm_to"], hit["hmm_from"] = cut, cut + 1
+                    if strand == "+":
+                        prev["end"], hit["start"] = prev_3, hit_5
+                    else:
+                        prev["start"], hit["end"] = prev_3, hit_5
+
+                # ------------------------------------------------------------
+                # 7. Exons 5' to 3': envelope coords at the outer ends,
+                #    alignment coords at the junctions
+                # ------------------------------------------------------------
+                exons = [[h["start"], h["end"]] for h in segment]
+                if strand == "+":
+                    exons[0][0] = segment[0]["env_start"]
+                    exons[-1][1] = segment[-1]["env_end"]
+                else:
+                    exons[0][1] = segment[0]["env_end"]
+                    exons[-1][0] = segment[-1]["env_start"]
+                exons = [tuple(e) for e in exons]
+
+                # ------------------------------------------------------------
+                # 8. Gene > rRNA > exons and introns, as in MFannot
+                # ------------------------------------------------------------
+                children = []
+                if len(exons) > 1:
+                    for exon, next_exon in zip(exons, exons[1:]):
+                        if strand == "+":
+                            intron = (exon[1] + 1, next_exon[0] - 1)
+                        else:
+                            intron = (next_exon[1] + 1, exon[0] - 1)
+                        children += [Feature("exon", [exon], strand), Feature("intron", [intron], strand)]
+                    children.append(Feature("exon", [exons[-1]], strand))
+
+                rrna = Feature("rRNA", exons, strand, {"product": products[gene_type]},
+                               children, score=round(sum(h["score"] for h in segment), 1))
+                span = (min(s for s, _ in exons), max(e for _, e in exons))
+                genes.append(Gene(seqid, "nhmmer", name, [span], strand, {"gene": name}, [rrna]))
+
+    return genes
 
 
-# ============================================================
-# GFF3 output
-# ============================================================
+def merge_annotations(mfannot_genes, aragorn_genes, hmmer_genes):
+    """
+    Combines MFannot, Aragorn and nhmmer genes. Aragorn tRNAs and nhmmer
+    rnl/rns replace MFannot's, so those MFannot genes are dropped. Only the
+    rRNA genes themselves are matched (rnl, rns, rnl_a...), so ORFs inside
+    their introns, which MFannot writes as separate genes, are kept.
+    """
+    kept = [gene for gene in mfannot_genes
+            if not gene.name.startswith("trn") and not re.fullmatch(r"rn[ls](_[a-z])?", gene.name)]
+    return kept + aragorn_genes + hmmer_genes
+
 
 def write_gff3(genes, path, contig_ids=None):
     """
@@ -648,10 +903,6 @@ def write_gff3(genes, path, contig_ids=None):
             f.write("\t".join(str(x) for x in row) + "\n")
 
 
-# ============================================================
-# GenBank output
-# ============================================================
-
 def genbank_features(genes):
     """
     Converts genes into Biopython SeqFeatures, grouped by contig and sorted
@@ -690,10 +941,6 @@ def genbank_features(genes):
     return per_contig
 
 
-# ============================================================
-# Main pipeline
-# ============================================================
-
 def annotate_sequence(
     seq_file,
     format,
@@ -707,8 +954,9 @@ def annotate_sequence(
     return_log: bool = False,
 ):
     """
-    Main pipeline: Annotates a FASTA or GenBank sequence file using MFannot and Aragorn.
-    Handles sequence rotation if circular sequences are present.
+    Main pipeline: Annotates a FASTA or GenBank sequence file using nhmmer
+    (rnl, rns), MFannot and Aragorn. Circular sequences are rotated to start
+    at rns.
 
     organelle is an organelle name ('chloroplast', 'plastid', 'mitochondrion',
     'mitochondria') or a genetic code number (e.g. 4 or "4").
@@ -800,6 +1048,7 @@ def annotate_sequence(
 
             records_dict = {rec.id: rec for rec in SeqIO.parse(str(working_fasta), "fasta")}
             contig_ids = list(records_dict.keys())
+            contig_lengths = {cid: len(rec.seq) for cid, rec in records_dict.items()}
             num_seqs = len(contig_ids)
             total_bp = sum(len(r.seq) for r in records_dict.values())
 
@@ -829,36 +1078,46 @@ def annotate_sequence(
                     is_circular[cid] = bool(circular) if circular is not None else False
 
             # ---------------------------------------------------------
-            # 4. SEQUENCE ROTATION (TO RNS START)
+            # 4. rRNA GENES (nhmmer) & ROTATION TO RNS START
             # ---------------------------------------------------------
+            # Circular contigs are rotated so that the 5' end of rns (rns_a if
+            # fragmented) becomes position 1 on the plus strand. nhmmer then
+            # runs again on the rotated sequences, so its genes use the same
+            # coordinates as MFannot's and Aragorn's.
+            hmm_tbl = tmp_path / f"{seq_stem}_nhmmer.tbl"
+            hmm_out = tmp_path / f"{seq_stem}_nhmmer.out"
+            log(annotate_hmmer(str(working_fasta), tmp_path, genetic_code), "nhmmer")
+            hmm_genes = parse_hmmer(hmm_tbl, hmm_out)
+
             reordered = False
             for cid in contig_ids:
                 if not is_circular[cid]:
                     continue
 
-                single_tmp = tmp_path / "single_rns_check.fasta"
-                SeqIO.write(records_dict[cid], str(single_tmp), "fasta")
-                hit = find_rns_start(single_tmp.name, directory=tmp_path)
-
+                hit = find_rns_start(hmm_genes, cid)
                 if hit is None:
                     log(f"No rns found in contig {cid}, proceeding without reordering")
-                else:
-                    strand, start = hit
-                    if strand == "+" and start == 1:
-                        log(f"rns already at position 1 in contig {cid}, no rotation needed")
-                    else:
-                        cut_pos = start - 1 if strand == "+" else start
-                        new_seq_str = reorder_sequence(str(records_dict[cid].seq), strand=strand, cut_pos=cut_pos)
+                    continue
 
-                        records_dict[cid].seq = Seq(new_seq_str)
-                        if is_gb_input and cid in gb_records:
-                            gb_records[cid].seq = Seq(new_seq_str)
+                strand, start = hit
+                if strand == "+" and start == 1:
+                    log(f"rns already at position 1 in contig {cid}, no rotation needed")
+                    continue
 
-                        reordered = True
-                        log(f"Rotated contig {cid} to start at rns (strand {strand}, position {start})")
+                cut_pos = start - 1 if strand == "+" else start
+                new_seq_str = reorder_sequence(str(records_dict[cid].seq), strand=strand, cut_pos=cut_pos)
+
+                records_dict[cid].seq = Seq(new_seq_str)
+                if is_gb_input and cid in gb_records:
+                    gb_records[cid].seq = Seq(new_seq_str)
+
+                reordered = True
+                log(f"Rotated contig {cid} to start at rns (strand {strand}, position {start})")
 
             if reordered:
                 SeqIO.write(list(records_dict.values()), str(working_fasta), "fasta")
+                log(annotate_hmmer(str(working_fasta), tmp_path, genetic_code), "nhmmer (rotated)")
+                hmm_genes = parse_hmmer(hmm_tbl, hmm_out)
 
             # ---------------------------------------------------------
             # 5. FEATURE ANNOTATION (MFannot & Aragorn)
@@ -880,24 +1139,24 @@ def annotate_sequence(
                 circ_fasta = tmp_path / f"{seq_stem}_circ.fasta"
                 SeqIO.write(circ_records, str(circ_fasta), "fasta")
                 log(annotate_aragorn(str(circ_fasta), tmp_path, genetic_code, circular=True), "Aragorn (circular)")
-                ar_genes = parse_aragorn(tmp_path / f"{seq_stem}_circ.txt", genetic_code, seq_stem)
+                ar_genes = parse_aragorn(tmp_path / f"{seq_stem}_circ.txt", genetic_code, seq_stem, contig_lengths)
 
                 lin_fasta = tmp_path / f"{seq_stem}_lin.fasta"
                 SeqIO.write(lin_records, str(lin_fasta), "fasta")
                 log(annotate_aragorn(str(lin_fasta), tmp_path, genetic_code, circular=False), "Aragorn (linear)")
-                ar_genes += parse_aragorn(tmp_path / f"{seq_stem}_lin.txt", genetic_code, seq_stem)
+                ar_genes += parse_aragorn(tmp_path / f"{seq_stem}_lin.txt", genetic_code, seq_stem, contig_lengths)
             else:
                 log(annotate_aragorn(str(working_fasta), tmp_path, genetic_code, circular=has_circular), "Aragorn")
-                ar_genes = parse_aragorn(tmp_path / f"{seq_stem}.txt", genetic_code, seq_stem)
+                ar_genes = parse_aragorn(tmp_path / f"{seq_stem}.txt", genetic_code, seq_stem, contig_lengths)
 
             tbl_file = tmp_path / f"{seq_stem}.tbl"
             mf_genes = parse_mfannot(tbl_file, genetic_code, contig_ids, seq_stem)
 
-            if not mf_genes and not ar_genes:
+            if not mf_genes and not ar_genes and not hmm_genes:
                 log(f"File {seq_stem} has no features")
                 return "\n".join(log_lines) if return_log else None
 
-            genes = merge_annotations(mf_genes, ar_genes)
+            genes = merge_annotations(mf_genes, ar_genes, hmm_genes)
 
             # ---------------------------------------------------------
             # 6. BACKUP & EXPORT
@@ -938,7 +1197,8 @@ def annotate_sequence(
             # 7. CLEANUP & FINISH
             # ---------------------------------------------------------
             if keep_intermediates:
-                for filename in [f"{seq_stem}.tbl", f"{seq_stem}.txt", f"{seq_stem}_circ.txt", f"{seq_stem}_lin.txt"]:
+                for filename in [f"{seq_stem}.tbl", f"{seq_stem}.txt", f"{seq_stem}_circ.txt", f"{seq_stem}_lin.txt",
+                                 f"{seq_stem}_nhmmer.tbl", f"{seq_stem}_nhmmer.out"]:
                     src = tmp_path / filename
                     if src.exists():
                         shutil.copy(src, out_dir / src.name)

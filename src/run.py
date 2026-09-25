@@ -12,15 +12,21 @@ VALID_GB = {".gb", ".gbk", ".genbank"}
 VALID_EXTENSIONS = VALID_FASTA | VALID_GB
 ORGANELLE_NAMES = {"chloroplast", "plastid", "mitochondrion", "mitochondria"}
 
+# NCBI translation tables (7, 8 and 17-20 are unassigned)
+GENETIC_CODES = {
+    "1", "2", "3", "4", "5", "6", "9", "10", "11", "12", "13", "14", "15", "16",
+    *map(str, range(21, 34)),
+}
+
 
 def organelle_arg(value):
-    """Checks --organelle: an organelle name or a genetic code number."""
+    """Checks --organelle: an organelle name or an NCBI genetic code number."""
     cleaned = value.strip().lower()
-    if cleaned in ORGANELLE_NAMES or cleaned.isdigit():
+    if cleaned in ORGANELLE_NAMES or cleaned in GENETIC_CODES:
         return cleaned
     raise argparse.ArgumentTypeError(
         f"'{value}' is not an organelle name ({', '.join(sorted(ORGANELLE_NAMES))}) "
-        f"or a genetic code number"
+        f"or a valid NCBI genetic code (1-6, 9-16, 21-33)"
     )
 
 
@@ -50,7 +56,8 @@ def main():
         help=(
             "Organelle type or NCBI genetic code number: chloroplast/plastid use code 11, "
             "mitochondrion/mitochondria code 4, or give the code directly (e.g. 1). "
-            "Required for single files; in batch mode, applies to all files if no suffix is given"
+            "Required for single files; in batch mode, applies to all files "
+            "(cannot be combined with --plastid_suffix or --mito_suffix)"
         ),
     )
     shared_group.add_argument(
@@ -165,6 +172,12 @@ def main():
         if not args.organelle and not args.plastid_suffix and not args.mito_suffix:
             parser.error(
                 "Batch mode requires either --organelle, --plastid_suffix, or --mito_suffix."
+            )
+
+        # Organelle suffixes decide the organelle themselves, so --organelle would be ignored
+        if args.organelle and (args.plastid_suffix or args.mito_suffix):
+            parser.error(
+                "--organelle cannot be combined with --plastid_suffix or --mito_suffix."
             )
 
         # Collect matching sequence files
@@ -284,11 +297,15 @@ def main():
 
         print("=" * 60 + "\n", flush=True)
 
+        # Non-zero exit so scripts can tell the batch had failures
+        if has_errors:
+            sys.exit(1)
+
     # ==========================
     # SINGLE FILE MODE (Target is a file)
     # ==========================
     else:
-        if any(active_suffixes):
+        if active_suffixes:
             parser.error("Suffix arguments can only be used in batch mode on a directory.")
 
         if not args.organelle:
